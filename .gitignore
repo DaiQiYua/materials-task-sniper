@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+# HAR 抓包含真实 JWT，严禁入库
+*.har
+# 本地私密配置（token 等）
+token.json
+.env
+# deepwork 内部状态
+.slim/deepwork/
+config.json
+history.jsonl
+*.log
+.sniper-data/
