@@ -650,6 +650,126 @@ class SniperEngine:
                 self._lim_ts = now
             return self._lim_data
 
+    # ============================ 平台子账号 ============================
+    def platform_accounts(self, platform: Optional[str] = None) -> dict:
+        """已发现的平台子账号（用于抢任务的 小红书/抖音/快手 等）。
+
+        汇总来源：① 任务 ``claimEligibility.accounts``（带 id，可能无名称）；
+        ② 上游 ``{base}/api/user/platform-accounts``（即 ``/pages/accounts/index``
+        实际调用的接口，HAR 已确认字段）。``platform`` 为空返回全部；带值时返回
+        该平台子集，若上游未标注任何平台归属，则回退返回全部并置 ``fallback=True``。
+        """
+        with self._lock:
+            tasks = list(self._tasks_map.values())
+        discovered: dict = {}
+        for t in tasks:
+            elig = t.get("claimEligibility") or {}
+            accounts = elig.get("accounts") or []
+            can = bool(elig.get("canClaim"))
+            for a in accounts:
+                raw_id = a.get("id") if isinstance(a, dict) else a
+                if raw_id is None:
+                    continue
+                try:
+                    aid = int(raw_id)
+                except Exception:
+                    continue
+                rec = discovered.get(aid) or {
+                    "id": aid, "name": None, "platform": None,
+                    "platformName": None, "total": 0, "claimable": 0,
+                }
+                rec["total"] += 1
+                if can:
+                    rec["claimable"] += 1
+                discovered[aid] = rec
+
+        # 来自 /pages/accounts/index 的真实接口（失败即忽略）
+        for u in self._fetch_upstream_platform_accounts():
+            raw_id = u.get("id")
+            if raw_id is None:
+                continue
+            try:
+                aid = int(raw_id)
+            except Exception:
+                continue
+            rec = discovered.get(aid) or {
+                "id": aid, "name": None, "platform": None,
+                "platformName": None, "total": 0, "claimable": 0,
+            }
+            rec["name"] = rec["name"] or u.get("name")
+            if u.get("platform"):
+                rec["platform"] = u["platform"]
+            if u.get("platformName"):
+                rec["platformName"] = u["platformName"]
+            # 透传上游字段，供前端展示账号/实名/校验状态
+            for k in ("account", "realName", "verifyStatus",
+                      "selfDisabled", "activeClaimCount"):
+                if u.get(k) is not None:
+                    rec.setdefault(k, u.get(k))
+            discovered[aid] = rec
+
+        items = list(discovered.values())
+        fallback = False
+        if platform:
+            tagged = [r for r in items
+                      if (r.get("platform") or "").lower() == platform.lower()]
+            if tagged:
+                items = tagged
+            else:
+                fallback = True  # 上游未标注平台，回退返回全部
+        return {"items": items, "fallback": fallback}
+
+    def _fetch_upstream_platform_accounts(self) -> list:
+        """最佳努力拉取上游平台账号；任何异常/非 200 都返回空列表。
+
+        字段对照（来自 ``/pages/accounts/index`` 调用的接口，已在 HAR 中确认）：
+          id           平台账号 id
+          platform     "xiaohongshu" / "douyin" / "kuaishou" 等（小写代码）
+          platformName "小红书" / "抖音" / "快手"（中文）
+          account      账号标识（如绑定的手机号/账号名）
+          realName     实名
+          verifyStatus "verified" 等
+          selfDisabled bool
+          activeClaimCount int
+        """
+        try:
+            status, obj = self._api_call(
+                "GET", "/api/user/platform-accounts", cfg=self._cfg, blocking=True)
+        except Exception:
+            return []
+        if status != 200 or not isinstance(obj, dict):
+            return []
+        data = obj.get("data")
+        if isinstance(data, list):
+            raw = data
+        elif isinstance(data, dict):
+            raw = data.get("items") or data.get("list") or []
+        else:
+            raw = []
+        out = []
+        for it in raw:
+            if not isinstance(it, dict):
+                continue
+            pid = (it.get("id") or it.get("platformAccountId")
+                   or it.get("accountId"))
+            if pid is None:
+                continue
+            # 显示名：实名优先，其次账号标识
+            name = (it.get("realName") or it.get("account")
+                    or it.get("nickname") or it.get("name") or "") or None
+            out.append({
+                "id": pid,
+                "name": name,
+                "platform": (it.get("platform") or "").lower(),
+                "platformName": it.get("platformName") or "",
+                "account": it.get("account"),
+                "realName": it.get("realName"),
+                "verifyStatus": it.get("verifyStatus"),
+                "selfDisabled": it.get("selfDisabled"),
+                "activeClaimCount": it.get("activeClaimCount"),
+            })
+        return out
+
     # ============================ 轮询 ============================
     def _poller_loop(self, task_type: str, stop_ev: threading.Event) -> None:
         self._log(f"启动轮询线程：{task_type}", "INFO")

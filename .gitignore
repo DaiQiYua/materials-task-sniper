@@ -12,3 +12,6 @@ config.json
 history.jsonl
 *.log
 .sniper-data/
+
+# WorkBuddy 助手本地数据（工作日志等）
+.workbuddy/

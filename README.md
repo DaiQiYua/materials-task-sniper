@@ -5,7 +5,8 @@ materials.xlya.cn 任务自动狙击系统：Web 前后台，自动轮询可领�
 ## 快速开始
 
 ```bash
-python -m server          # 启动后浏览器打开 http://127.0.0.1:8787
+python run.py --reload    # 开发模式（热重载），启动后浏览器打开 http://127.0.0.1:8787
+python run.py             # 生产模式（无热重载）
 python -m pytest test_webapp.py test_login.py -q   # 跑测试
 ```
 

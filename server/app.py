@@ -359,6 +359,16 @@ def get_history(request: Request) -> dict:
     return {"items": _engine(request).history()}
 
 
+@app.get("/api/platform-accounts")
+def get_platform_accounts(request: Request, platform: Optional[str] = None) -> dict:
+    """已发现的平台子账号（用于抢任务的 小红书/抖音/快手 等）。
+
+    无 ``platform`` 返回全部；带值时返回该平台子集；若上游未标注平台归属，
+    则回退返回全部并置 ``fallback=True``（前端据此提示）。任何失败均无日志噪音。
+    """
+    return _engine(request).platform_accounts(platform)
+
+
 # -------------------------- 凭据 / 登录会话 --------------------------
 @app.get("/api/credentials")
 def get_credentials(request: Request) -> dict:
