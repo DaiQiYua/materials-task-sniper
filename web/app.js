@@ -79,6 +79,7 @@ function renderStatus(s) {
 
   renderTokenBadge(s.token);
   renderTelemetry(s);
+  updateTokenBanner(s);
 }
 
 function daysLeft(exp) {
@@ -329,7 +330,17 @@ function openTokenModal() {
     ? `当前过期时间：${String(tok.exp).replace('T', ' ').slice(0, 19)}`
     : '尚未配置 Token';
   $('tokenModal').classList.remove('hidden');
+  loadCreds();          // 每次打开刷新凭据列表
+  syncLoginView();      // 若服务端有活跃会话则恢复进度显示
   $('tokenInput').focus();
+}
+
+function flashSection(id) {
+  const sec = $(id);
+  if (!sec) return;
+  sec.classList.remove('flash');
+  void sec.offsetWidth; // 重置动画
+  sec.classList.add('flash');
 }
 
 function closeTokenModal() {
@@ -352,6 +363,220 @@ async function onSubmitToken(e) {
   } finally {
     btn.disabled = false;
   }
+}
+
+/* ── Token 引导横幅 ── */
+let bannerDismissed = false;
+
+function updateTokenBanner(s) {
+  const show = !!(s && s.token && !s.token.present) && !bannerDismissed;
+  $('tokenBanner').classList.toggle('hidden', !show);
+}
+
+/* ── 凭据管理（账号密码取 Token） ── */
+function fmtAgo(ts) {
+  const t = Number(ts);
+  if (!isFinite(t) || t <= 0) return '';
+  const d = Date.now() / 1000 - t;
+  if (d < 60) return '刚刚';
+  if (d < 3600) return `${Math.floor(d / 60)} 分钟前`;
+  if (d < 86400) return `${Math.floor(d / 3600)} 小时前`;
+  return `${Math.floor(d / 86400)} 天前`;
+}
+
+function renderCreds(data) {
+  const items = (data && data.items) || [];
+  const list = $('credList');
+  list.textContent = '';
+  const frag = document.createDocumentFragment();
+  for (const c of items) {
+    const row = el('div', 'cred-row');
+
+    const info = el('div', 'cred-info');
+    info.appendChild(el('div', 'cred-name', c.name || '未命名账号'));
+    info.appendChild(el('div', 'cred-phone', c.phone || '—'));
+    const metaText = c.last_error ? `最近失败：${c.last_error}`
+      : (c.last_ok_at ? `上次成功：${fmtAgo(c.last_ok_at)}` : '从未取过 Token');
+    info.appendChild(el('div', 'cred-meta' + (c.last_error ? ' err' : ''), metaText));
+    row.appendChild(info);
+
+    const btnFetch = el('button', 'btn btn-xs', '取 Token');
+    btnFetch.type = 'button';
+    btnFetch.addEventListener('click', () => fetchTokenById(c.id, btnFetch));
+    row.appendChild(btnFetch);
+
+    const btnDel = el('button', 'btn btn-xs btn-del', '删除');
+    btnDel.type = 'button';
+    btnDel.addEventListener('click', () => deleteCred(c.id));
+    row.appendChild(btnDel);
+
+    frag.appendChild(row);
+  }
+  list.appendChild(frag);
+  $('credEmpty').classList.toggle('hidden', items.length > 0);
+  $('btnFetchAny').disabled = items.length === 0;
+
+  const note = $('credNote');
+  if (data && data.dpapi === false) {
+    note.className = 'cred-note warn';
+    note.textContent = '非 Windows 环境，凭据将明文存储';
+  } else {
+    note.className = 'cred-note';
+    note.textContent = '凭据已加密存储';
+  }
+}
+
+async function loadCreds() {
+  try { renderCreds(await api('/api/credentials')); } catch (_) { /* 列表刷新失败静默 */ }
+}
+
+async function onAddCred(e) {
+  e.preventDefault();
+  const phone = $('credPhone').value.trim();
+  const password = $('credPwd').value;
+  const name = $('credName').value.trim();
+  if (!/^1[3-9]\d{9}$/.test(phone)) { toast('请输入有效的 11 位手机号', 'warn'); return; }
+  if (!password) { toast('请输入密码', 'warn'); return; }
+  const btn = $('credAdd');
+  btn.disabled = true;
+  try {
+    await api('/api/credentials', { method: 'POST', body: JSON.stringify({ name, phone, password }) });
+    $('credPhone').value = ''; $('credPwd').value = ''; $('credName').value = '';
+    toast('账号已添加');
+    await loadCreds();
+  } catch (err) {
+    toast('添加失败：' + err.message, 'err');
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function fetchTokenById(id, btn) {
+  if (btn) btn.disabled = true;
+  try {
+    const r = await api(`/api/credentials/${id}/fetch-token`, { method: 'POST' });
+    if (r && r.ok) {
+      toast(`Token 已获取（${r.phone || '账号'}）`);
+      refreshStatus();
+    } else {
+      toast('取 Token 失败：' + ((r && r.error) || '未知错误'), 'err');
+    }
+  } catch (err) {
+    toast('取 Token 失败：' + err.message, 'err');
+  } finally {
+    if (btn) btn.disabled = false;
+    await loadCreds();
+  }
+}
+
+async function onFetchAny() {
+  const btn = $('btnFetchAny');
+  btn.disabled = true;
+  try {
+    const r = await api('/api/token/fetch-any', { method: 'POST' });
+    if (r && r.ok) {
+      toast(`Token 已获取（${r.phone || '账号'}）`);
+      refreshStatus();
+    } else {
+      const n = (r && r.attempts && r.attempts.length) || 0;
+      toast(`全部失败（${n} 个账号）：` + ((r && r.error) || ''), 'err');
+    }
+  } catch (err) {
+    toast('取 Token 失败：' + err.message, 'err');
+  } finally {
+    btn.disabled = false;
+    await loadCreds();
+  }
+}
+
+async function deleteCred(id) {
+  if (!confirm('删除该账号？（需重新添加才能再取 Token）')) return;
+  try {
+    await api(`/api/credentials/${id}`, { method: 'DELETE' });
+    toast('已删除');
+    await loadCreds();
+  } catch (err) {
+    toast('删除失败：' + err.message, 'err');
+  }
+}
+
+/* ── 浏览器登录取 Token（交互会话） ── */
+const LOGIN_PHASE_TEXT = {
+  opening: '正在打开浏览器…',
+  waiting_login: '等待你完成登录…',
+  captured: '已捕获 Token',
+  closed: '会话已结束',
+  error: '会话出错',
+};
+let loginTimer = null;
+
+function setLoginView(active) {
+  $('loginIdle').classList.toggle('hidden', active);
+  $('loginActive').classList.toggle('hidden', !active);
+  if (!active) stopLoginPoll();
+}
+
+function stopLoginPoll() {
+  if (loginTimer) { clearInterval(loginTimer); loginTimer = null; }
+}
+
+function onSessionStatus(s) {
+  const phase = (s && s.phase) || 'idle';
+  if (phase === 'idle') { setLoginView(false); return; }
+  setLoginView(true);
+  $('loginPhase').textContent = LOGIN_PHASE_TEXT[phase] || phase;
+  const elp = Number(s && s.elapsed);
+  $('loginElapsed').textContent = isFinite(elp) && elp > 0 ? `已等待 ${Math.round(elp)}s` : '';
+  const msg = (s && s.message) || '';
+  const msgEl = $('loginMsg');
+  msgEl.textContent = msg;
+  msgEl.classList.toggle('hidden', !msg);
+
+  if (phase === 'captured') {
+    stopLoginPoll();
+    toast('已从浏览器捕获 Token');
+    closeTokenModal();
+    refreshStatus();
+  } else if (phase === 'closed' || phase === 'error') {
+    stopLoginPoll();
+    toast('登录会话：' + (msg || LOGIN_PHASE_TEXT[phase]), phase === 'error' ? 'err' : 'warn');
+    setLoginView(false);
+  }
+}
+
+function startLoginPoll() {
+  stopLoginPoll();
+  loginTimer = setInterval(async () => {
+    try { onSessionStatus(await api('/api/login-session')); } catch (_) { /* 下轮再试 */ }
+  }, 1000);
+}
+
+async function syncLoginView() {
+  try {
+    const s = await api('/api/login-session');
+    if (s && s.active) { onSessionStatus(s); startLoginPoll(); }
+    else setLoginView(false);
+  } catch (_) { setLoginView(false); }
+}
+
+async function startLoginSession() {
+  const btn = $('btnLoginStart');
+  btn.disabled = true;
+  try {
+    await api('/api/login-session', { method: 'POST', body: JSON.stringify({ mode: 'interactive' }) });
+    setLoginView(true);
+    onSessionStatus({ phase: 'opening', elapsed: 0 });
+    startLoginPoll();
+  } catch (err) {
+    toast('打开登录窗口失败：' + err.message, 'err');
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function cancelLoginSession() {
+  try { await api('/api/login-session', { method: 'DELETE' }); } catch (_) { /* 幂等 */ }
+  setLoginView(false);
 }
 
 /* ── 启动 / 停止 ── */
@@ -418,7 +643,7 @@ function connectSSE() {
   $('jumpBottom').addEventListener('click', () => setAutoScroll(true));
   $('btnClearLogs').addEventListener('click', () => { $('logList').textContent = ''; });
 
-  // 配置 / Token / 动作
+  // Token 弹层 / 动作
   $('configForm').addEventListener('submit', onSaveConfig);
   $('btnStart').addEventListener('click', () => act('/api/start', '狙击已启动'));
   $('btnStop').addEventListener('click', () => act('/api/stop', '已停止'));
@@ -426,6 +651,19 @@ function connectSSE() {
   $('tokenClose').addEventListener('click', closeTokenModal);
   $('tokenCancel').addEventListener('click', closeTokenModal);
   $('tokenForm').addEventListener('submit', onSubmitToken);
+
+  // Token 引导横幅
+  $('bannerClose').addEventListener('click', () => { bannerDismissed = true; updateTokenBanner(state.status); });
+  $('bannerCreds').addEventListener('click', () => { openTokenModal(); flashSection('secCreds'); });
+  $('bannerBrowser').addEventListener('click', () => { openTokenModal(); flashSection('secBrowser'); });
+
+  // 凭据管理
+  $('credForm').addEventListener('submit', onAddCred);
+  $('btnFetchAny').addEventListener('click', onFetchAny);
+
+  // 浏览器登录会话
+  $('btnLoginStart').addEventListener('click', startLoginSession);
+  $('btnLoginCancel').addEventListener('click', cancelLoginSession);
   $('tokenModal').addEventListener('click', (e) => {
     if (e.target === $('tokenModal')) closeTokenModal();
   });
@@ -448,6 +686,7 @@ function connectSSE() {
   } catch (err) {
     toast('初始化加载失败：' + err.message, 'err');
   }
+  loadCreds();
 
   connectSSE();
 })();

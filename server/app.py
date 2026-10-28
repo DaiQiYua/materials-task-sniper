@@ -18,6 +18,9 @@ from sse_starlette.sse import EventSourceResponse
 
 from . import persist
 from .core import SniperEngine
+from .credentials import (PHONE_RE, CredentialStore, mask_phone,
+                          normalize_phone, verify_dpapi)
+from .login import LoginBusy, LoginManager, is_upstream_error
 
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
 ALLOWED_HOSTS = {"localhost", "127.0.0.1"}
@@ -167,6 +170,46 @@ class TokenPatch(BaseModel):
     token: str = Field(min_length=1)
 
 
+class CredentialIn(BaseModel):
+    """POST /api/credentials：手机号不符 ``/^1[3-9]\\d{9}$/`` → 422。"""
+
+    model_config = ConfigDict(extra="ignore")
+
+    name: Optional[str] = None
+    phone: str = Field(min_length=1)
+    password: str = Field(min_length=1)
+
+    @field_validator("phone")
+    @classmethod
+    def _check_phone(cls, value: str) -> str:
+        value = normalize_phone(value)
+        if not PHONE_RE.match(value):
+            raise ValueError("手机号格式不正确（应为 1[3-9] 开头的 11 位数字）")
+        return value
+
+    @field_validator("name")
+    @classmethod
+    def _check_name(cls, value: Optional[str]) -> Optional[str]:
+        return (value or "").strip()[:64]
+
+    @field_validator("password")
+    @classmethod
+    def _check_password(cls, value: str) -> str:
+        if not value:
+            raise ValueError("密码不能为空")
+        return value
+
+
+class LoginSessionIn(BaseModel):
+    """POST /api/login-session。target_url 仅允许 http/https。"""
+
+    model_config = ConfigDict(extra="ignore")
+
+    mode: str = "interactive"
+    debug: bool = False
+    target_url: Optional[str] = None
+
+
 # ============================ 应用 ============================
 def _engine(request: Request) -> SniperEngine:
     return request.app.state.engine
@@ -193,6 +236,22 @@ async def lifespan(app: FastAPI):
     app.state.bus = bus
     app.state.engine = engine
     app.state.data_dir = directory
+
+    # ---- 凭据存储 + DPAPI 加密状态（启动探测，供 UI 展示）----
+    store = CredentialStore(directory, on_log=engine.log)
+    encryption = verify_dpapi()
+    app.state.credentials = store
+    app.state.encryption = encryption
+    if not encryption.get("available"):
+        engine.log(f"凭据加密不可用：{encryption.get('detail')}", "WARN")
+
+    # ---- 登录管理（交互式会话 + 凭据直登 + 自动续登）----
+    login_manager = LoginManager(engine, bus=bus, store=store)
+    app.state.login_manager = login_manager
+    try:
+        login_manager.start_auto_renew()
+    except Exception as exc:
+        engine.log(f"自动续登线程启动失败：{exc}", "WARN")
 
     # ---- 恢复 config.json ----
     saved_config = None
@@ -226,6 +285,11 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        # 关停顺序：登录会话/自动续登 → 杀残留 playwright/Edge → 引擎线程
+        try:
+            login_manager.shutdown()
+        except Exception:
+            pass
         try:
             engine.stop()
         except Exception:
@@ -293,6 +357,100 @@ def get_tasks(request: Request) -> dict:
 @app.get("/api/history")
 def get_history(request: Request) -> dict:
     return {"items": _engine(request).history()}
+
+
+# -------------------------- 凭据 / 登录会话 --------------------------
+@app.get("/api/credentials")
+def get_credentials(request: Request) -> dict:
+    """脱敏列表：phone 中间四位打码，永不返回 password / password_enc。
+
+    ``encryption``（含 ``available/mode/detail``）是附加信息，供 UI 展示加密
+    状态；``dpapi`` 是同一信息的布尔快捷字段（前端 `data.dpapi === false`
+    即提示「降级明文存储」）。
+    """
+    encryption = request.app.state.encryption
+    return {
+        "items": request.app.state.credentials.list_public(),
+        "encryption": encryption,
+        "dpapi": bool(encryption.get("available")),
+    }
+
+
+@app.post("/api/credentials", status_code=201)
+def post_credential(payload: CredentialIn, request: Request) -> dict:
+    try:
+        item = request.app.state.credentials.add(payload.name, payload.phone,
+                                                 payload.password)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    _engine(request).log(f"已添加登录凭据：{item['name'] or '未命名'}（{item['phone']}）",
+                         "INFO")
+    return item
+
+
+@app.delete("/api/credentials/{cred_id}")
+def delete_credential(cred_id: int, request: Request) -> dict:
+    store = request.app.state.credentials
+    record = store.get(cred_id)
+    deleted = store.delete(cred_id)
+    if deleted and record is not None:
+        _engine(request).log(f"已删除登录凭据：{record.get('name') or '未命名'}"
+                             f"（{mask_phone(record.get('phone'))}）", "INFO")
+    return {"ok": True, "id": cred_id, "deleted": bool(deleted)}
+
+
+@app.post("/api/credentials/{cred_id}/fetch-token")
+def post_fetch_token(cred_id: int, request: Request) -> dict:
+    """用单条凭据登录取 token。失败仍 200（由 ok 区分），上游 5xx → 502。"""
+    manager = request.app.state.login_manager
+    if request.app.state.credentials.get(cred_id) is None:
+        raise HTTPException(status_code=404, detail="凭据不存在")
+    result = manager.fetch_one(cred_id)
+    upstream_error = bool(result.pop("_upstream_error", False))
+    if not result.get("ok") and (upstream_error or is_upstream_error(result.get("error"))):
+        raise HTTPException(status_code=502, detail=result.get("error") or "上游服务错误")
+    return result
+
+
+@app.post("/api/token/fetch-any")
+def post_fetch_any(request: Request) -> dict:
+    """依次尝试全部凭据直到首个成功。"""
+    result = request.app.state.login_manager.fetch_any()
+    result.pop("_upstream_error", None)
+    return result
+
+
+@app.post("/api/login-session")
+def post_login_session(payload: LoginSessionIn, request: Request) -> dict:
+    mode = (payload.mode or "interactive").strip().lower()
+    if mode != "interactive":
+        raise HTTPException(status_code=400, detail="仅支持 interactive 模式")
+    base = str(_engine(request).snapshot().get("base") or "").rstrip("/")
+    target = (payload.target_url or "").strip() or (base + "/pages/auth/login")
+    try:
+        return request.app.state.login_manager.start_interactive(
+            target, debug=bool(payload.debug))
+    except LoginBusy as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.get("/api/login-session")
+def get_login_session(request: Request) -> dict:
+    return request.app.state.login_manager.status()
+
+
+@app.delete("/api/login-session")
+def delete_login_session(request: Request) -> dict:
+    """取消并关闭浏览器；幂等（没有会话也 200）。"""
+    manager = request.app.state.login_manager
+    try:
+        status = manager.cancel()
+    except Exception as exc:
+        _engine(request).log(f"关闭登录会话失败：{exc}", "WARN")
+        status = manager.status()
+    return {"ok": True, **status}
 
 
 # ------------------------------- SSE -------------------------------

@@ -6,6 +6,7 @@
 - ``token.json``   : {"token": "eyJ..."}（**永不**出现在日志/事件里）
 - ``config.json``  : Config 全量快照
 - ``history.jsonl``: 每次领取尝试一行 JSON
+- ``credentials.json``: 登录凭据（密码为 DPAPI 密文；非 Windows 降级明文）
 - ``sniper.log``   : RotatingFileHandler 纯文本日志
 """
 
@@ -23,6 +24,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 TOKEN_FILE = "token.json"
 CONFIG_FILE = "config.json"
 HISTORY_FILE = "history.jsonl"
+CREDENTIALS_FILE = "credentials.json"
 LOG_FILE = "sniper.log"
 
 _LOG_FORMAT = "%(asctime)s %(levelname)-5s %(message)s"
@@ -57,6 +59,11 @@ def history_path(directory: Optional[Path | str] = None) -> Path:
 
 def log_path(directory: Optional[Path | str] = None) -> Path:
     return Path(directory) / LOG_FILE if directory is not None else data_dir() / LOG_FILE
+
+
+def credentials_path(directory: Optional[Path | str] = None) -> Path:
+    return (Path(directory) / CREDENTIALS_FILE if directory is not None
+            else data_dir() / CREDENTIALS_FILE)
 
 
 def _atomic_write(path: Path, text: str) -> None:
@@ -102,6 +109,22 @@ def load_config(directory: Optional[Path | str] = None) -> Optional[dict]:
 
 def save_config(cfg: dict, directory: Optional[Path | str] = None) -> None:
     _atomic_write(config_path(directory), json.dumps(cfg, ensure_ascii=False, indent=2))
+
+
+# ---------------------------- credentials ----------------------------
+def load_credentials(directory: Optional[Path | str] = None) -> Optional[dict]:
+    """原始结构：{"version":1,"next_id":N,"items":[{...password_enc...}]}。
+
+    注意：里面的 ``password_enc`` 可能是 DPAPI 密文，也可能（非 Windows 降级）
+    是 ``plain:v1:<明文>`` —— 该文件**永不**进日志、**永不**直接回前端。
+    """
+    obj = _read_json(credentials_path(directory))
+    return obj if isinstance(obj, dict) else None
+
+
+def save_credentials(data: dict, directory: Optional[Path | str] = None) -> None:
+    _atomic_write(credentials_path(directory),
+                  json.dumps(data, ensure_ascii=False, indent=2))
 
 
 # ------------------------------ history ------------------------------

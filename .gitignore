@@ -4,6 +4,7 @@ __pycache__/
 *.har
 # 本地私密配置（token 等）
 token.json
+credentials.json
 .env
 # deepwork 内部状态
 .slim/deepwork/

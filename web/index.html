@@ -46,6 +46,16 @@
     </button>
   </header>
 
+  <!-- ══ Token 引导横幅（仅未配置时显示） ══ -->
+  <div id="tokenBanner" class="token-banner hidden" role="alert">
+    <span class="banner-dot"></span>
+    <span class="banner-text">尚未配置 Token，狙击无法启动</span>
+    <div class="topbar-spacer"></div>
+    <button id="bannerCreds" class="btn btn-primary btn-xs" type="button">账号密码获取</button>
+    <button id="bannerBrowser" class="btn btn-ghost btn-xs" type="button">打开浏览器登录</button>
+    <button id="bannerClose" class="btn-tool" type="button" aria-label="关闭提示">✕</button>
+  </div>
+
   <!-- ══ SSE 断线提示 ══ -->
   <div id="connBanner" class="conn-banner hidden" role="alert">
     <span class="pulse-dot"></span>连接断开，重连中…
@@ -200,7 +210,7 @@
 <!-- ══ Toast ══ -->
 <div id="toastWrap" class="toast-wrap" aria-live="polite"></div>
 
-<!-- ══ Token 弹层 ══ -->
+<!-- ══ Token 弹层：三区块 ══ -->
 <div id="tokenModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="tokenTitle">
   <div class="modal-card">
     <header class="modal-head">
@@ -208,15 +218,62 @@
       <button id="tokenClose" class="btn-tool" type="button" aria-label="关闭">✕</button>
     </header>
     <p id="tokenHint" class="modal-hint">尚未配置 Token</p>
-    <form id="tokenForm">
-      <textarea id="tokenInput" class="token-input" spellcheck="false"
-        placeholder="粘贴 JWT（eyJ… 开头）"></textarea>
-      <p id="tokenErr" class="token-err hidden"></p>
-      <footer class="modal-foot">
-        <button id="tokenCancel" class="btn btn-ghost" type="button">取消</button>
-        <button id="tokenSave" class="btn btn-primary" type="submit">保存并校验</button>
-      </footer>
-    </form>
+
+    <div class="modal-body">
+
+      <!-- A. 账号密码取 Token -->
+      <section class="tok-sec" id="secCreds" aria-label="账号密码取 Token">
+        <h4 class="tok-sec-title"><span class="sec-index">A</span>账号密码取 Token</h4>
+        <div id="credList" class="cred-list"></div>
+        <div id="credEmpty" class="empty-state">暂无账号，添加后可一键取 Token</div>
+        <form id="credForm" class="cred-form" autocomplete="off">
+          <input id="credName" type="text" placeholder="备注名（可空）" maxlength="32">
+          <input id="credPhone" type="text" inputmode="numeric" maxlength="11" placeholder="请输入手机号">
+          <input id="credPwd" type="password" placeholder="密码" autocomplete="new-password">
+          <button id="credAdd" class="btn btn-primary btn-sm" type="submit">添加账号</button>
+        </form>
+        <div class="cred-foot">
+          <span id="credNote" class="cred-note"></span>
+          <div class="topbar-spacer"></div>
+          <button id="btnFetchAny" class="btn btn-sm" type="button">全部尝试</button>
+        </div>
+      </section>
+
+      <!-- B. 浏览器登录取 Token（兜底） -->
+      <section class="tok-sec" id="secBrowser" aria-label="浏览器登录取 Token">
+        <h4 class="tok-sec-title"><span class="sec-index">B</span>浏览器登录取 Token</h4>
+        <div id="loginIdle">
+          <p class="tok-sec-desc">将打开原站登录页，登录后自动获取（约 3 分钟有效）</p>
+          <button id="btnLoginStart" class="btn btn-sm" type="button">打开登录窗口</button>
+        </div>
+        <div id="loginActive" class="hidden">
+          <div class="login-progress">
+            <span class="pulse-dot"></span>
+            <span id="loginPhase">正在打开浏览器…</span>
+            <span id="loginElapsed" class="login-elapsed"></span>
+          </div>
+          <p id="loginMsg" class="login-msg hidden"></p>
+          <div class="login-foot">
+            <button id="btnLoginCancel" class="btn btn-danger btn-sm" type="button">取消</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- C. 手动粘贴 Token -->
+      <section class="tok-sec" id="secManual" aria-label="手动粘贴 Token">
+        <h4 class="tok-sec-title"><span class="sec-index">C</span>手动粘贴 Token</h4>
+        <form id="tokenForm">
+          <textarea id="tokenInput" class="token-input" spellcheck="false"
+            placeholder="粘贴 JWT（eyJ… 开头）"></textarea>
+          <p id="tokenErr" class="token-err hidden"></p>
+          <footer class="modal-foot">
+            <button id="tokenCancel" class="btn btn-ghost" type="button">取消</button>
+            <button id="tokenSave" class="btn btn-primary" type="submit">保存并校验</button>
+          </footer>
+        </form>
+      </section>
+
+    </div>
   </div>
 </div>
 
