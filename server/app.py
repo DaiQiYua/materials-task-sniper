@@ -141,6 +141,13 @@ class ConfigPatch(BaseModel):
     page_size: Optional[int] = Field(default=None, ge=1, le=200)
     http_timeout: Optional[float] = Field(default=None, ge=1, le=120)
     result_polls: Optional[int] = Field(default=None, ge=0, le=20)
+    # ---- 性能 / 策略 ----
+    claim_workers: Optional[int] = Field(default=None, ge=1, le=10)
+    poll_rate_max: Optional[int] = Field(default=None, ge=1, le=10000)
+    poll_rate_window: Optional[float] = Field(default=None, ge=0.1, le=3600)
+    seen_ttl: Optional[float] = Field(default=None, ge=0, le=3600)
+    bottom_first: Optional[bool] = None
+    early_fire: Optional[bool] = None
 
     @field_validator("base")
     @classmethod
