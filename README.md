@@ -12,6 +12,22 @@ python -m pytest test_webapp.py test_login.py -q   # 跑测试
 
 旧版 CLI 脚本 `task_sniper.py` 仍可直接运行（`python task_sniper.py`），行为不变。
 
+## 抢单性能参数（`PUT /api/config`）
+
+| 字段 | 默认 | 说明 |
+|---|---|---|
+| `poll_interval` | 0.4 | 每轮列表轮询间隔（秒） |
+| `max_pages` | 2 | 每轮扫描页数；越靠后的位置越优先抢 |
+| `rate_limit_max/window` | 6 / 10s | **领取**请求令牌桶（与上游 claim 限额一致） |
+| `poll_rate_max/window` | 5 / 1s | **列表/配额**请求令牌桶，与领取独立，抢不到就跳过本轮 |
+| `claim_workers` | 3 | 领取线程数（1~10） |
+| `bottom_first` | true | 列表尾部优先：多数人抢首位，尾部竞争更小 |
+| `early_fire` | true | 按 `serverNowMs` 校时，冷却结束前 RTT/2 提前发射 |
+| `seen_ttl` | 180 | 失败任务的重新发现冷却（秒），成功任务本进程内永不再抢 |
+
+列表轮询遇到上游 429 会自动退避 5 秒；领取 429 按 2s 起指数退避，最多重试 4 次。
+
+
 ## 取 Token 的三种方式（仪表盘 Token 弹层）
 
 | 方式 | 说明 |

@@ -1,5 +1,10 @@
 __pycache__/
 *.pyc
+# 本地虚拟环境与安装缓存
+.venv/
+.pip-cache/
+.tmp/
+.ms-playwright/
 # HAR 抓包含真实 JWT，严禁入库
 *.har
 # 本地私密配置（token 等）

@@ -1,30 +1,34 @@
 # -*- coding: utf-8 -*-
-"""SniperEngine —— 把 ``task_sniper.py`` 的模块级逻辑实例化重写。
+"""SniperEngine —— 低延迟、可重试的抢单引擎。
 
-设计要点（对应 API 契约硬性约束）：
-- 所有状态（seen/in_flight/限速器/队列/统计/快照/历史/日志）都是**实例属性**，
-  没有模块级可变全局，可同时存在多个引擎（测试里每个进程一个）。
-- 配置是**不可变 dataclass** ``EngineConfig``；``update_config`` 在锁内原子替换
-  整个配置对象，线程每轮循环开头重新读取 ``self._cfg``，因此全部字段热更。
-- 线程循环体整体 try/except：异常 → ERR 日志事件 + ``state="error"`` + 退避 1s
-  续跑，线程不死。
-- token 永不写入日志或事件（只出现在发往上游的 Authorization 头里）。
+相对旧实现的关键变化：
+1. HTTP keep-alive 连接复用（线程内一条长连接），砍掉每次请求的 TCP/TLS 握手；
+2. 列表轮询与领取各自独立令牌桶，领取永远优先，列表不再抢领取额度；
+3. 领取线程池（默认 3）+ 带优先级的延迟调度队列：冷却/限流只重排、不阻塞线程；
+4. 默认「列表从下往上抢」（``bottom_first``）：多数人只抢列表首位，尾部命中率更高；
+5. claim-limits 后台异步刷新（领取路径零阻塞），用 ``serverNowMs`` 校正时钟，
+   并在冷却结束前 ``RTT/2`` 提前发射；
+6. 日志文件写入异步化，领取关键路径不落盘；
+7. 失败分类重试：429 / 网络抖动 / 待处理满 → 延迟重排；409 为终态；
+   ``seen`` 带 TTL，短暂失败后过一段时间仍可重新发现；
+8. 领取成功按上游 ``retryAfterSeconds`` 设置全局冷却，避免多 worker 把额度打爆。
 """
 
 from __future__ import annotations
 
 import base64
+import heapq
+import http.client
 import json
 import logging
 import queue
 import threading
 import time
-import urllib.error
-import urllib.request
 from collections import deque
 from dataclasses import dataclass, fields, replace
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
+from urllib.parse import urlsplit
 
 from . import persist
 
@@ -33,8 +37,11 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:158.0) "
 
 MAX_HISTORY = 200          # 历史环形缓冲
 MAX_LOGS = 500             # 日志环形缓冲
-LIMITS_TTL = 3.0           # claim-limits 缓存秒数
-RESULT_POLL_INTERVAL = 0.4
+LIMITS_TTL = 2.0           # claim-limits 后台刷新间隔（秒）
+LIMITS_MAX_AGE = 15.0      # 超过该秒数的配额快照视为不可用
+RESULT_POLL_INTERVAL = 0.25
+MAX_CLAIM_ATTEMPTS = 4     # 429 最大重试次数
+MAX_PENDING_ATTEMPTS = 6   # 待处理满最大重排次数
 
 
 # ------------------------------ JWT ---------------------------------
@@ -67,7 +74,7 @@ def exp_to_iso(exp: Optional[int]) -> Optional[str]:
 
 # --------------------------- 令牌桶限速 ------------------------------
 class RateLimiter:
-    """经典令牌桶。与 task_sniper.RateLimiter 行为一致，但属于实例。"""
+    """经典令牌桶。每个引擎可持有多个实例（领取 / 轮询各一套）。"""
 
     def __init__(self, max_count: float, window: float) -> None:
         self.cap = float(max_count)
@@ -101,21 +108,169 @@ class RateLimiter:
             return False
 
 
+# ------------------------- 领取调度（优先级 + 延迟） -------------------
+class ClaimScheduler:
+    """最小堆调度器：按 (到期时间, 优先级, 入队序号) 出队。
+
+    - ``priority`` 越小越先出队（「列表从下往上抢」用负数 rank 实现）；
+    - ``delay`` 用于冷却 / 限流重排：任务在到期前不会占用领取线程；
+    - ``pop`` 在没有任何到期任务时最多等 ``timeout`` 秒。
+    """
+
+    def __init__(self) -> None:
+        self._cond = threading.Condition()
+        self._heap: list = []
+        self._seq = 0
+        self._closed = False
+
+    def push(self, item: dict, task_type: str, priority: int,
+             account_id: Optional[int], delay: float, attempts: int) -> None:
+        due = time.monotonic() + max(0.0, float(delay))
+        with self._cond:
+            self._seq += 1
+            heapq.heappush(self._heap, (due, int(priority), self._seq,
+                                        item, task_type, account_id, int(attempts)))
+            self._cond.notify()
+
+    def pop(self, timeout: float) -> Optional[tuple]:
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        with self._cond:
+            while True:
+                now = time.monotonic()
+                if self._heap:
+                    due = self._heap[0][0]
+                    if due <= now:
+                        _, _, _, item, task_type, account_id, attempts = heapq.heappop(self._heap)
+                        return (item, task_type, account_id, attempts)
+                    wait = min(due - now, deadline - now)
+                else:
+                    wait = deadline - now
+                if self._closed or wait <= 0:
+                    return None
+                self._cond.wait(wait)
+
+    def clear(self) -> int:
+        with self._cond:
+            dropped = len(self._heap)
+            self._heap = []
+            return dropped
+
+    def size(self) -> int:
+        with self._cond:
+            return len(self._heap)
+
+
+# --------------------------- HTTP 连接复用 ---------------------------
+class HttpPool:
+    """线程内 keep-alive 连接池（每线程每个目标一条），断线自动重建一次。
+
+    相比每次 ``urllib.urlopen`` 重新 TCP + TLS 握手，公网场景可省 1~2 个 RTT。
+    """
+
+    def __init__(self) -> None:
+        self._local = threading.local()
+
+    def _store(self) -> dict:
+        store = getattr(self._local, "conns", None)
+        if store is None:
+            store = {}
+            self._local.conns = store
+        return store
+
+    def _target(self, cfg) -> tuple:
+        parts = urlsplit(str(cfg.base))
+        scheme = (parts.scheme or "https").lower()
+        host = parts.hostname or ""
+        port = parts.port or (443 if scheme == "https" else 80)
+        return scheme, host, port
+
+    def _connect(self, cfg, key: tuple):
+        scheme, host, port = key
+        if scheme == "https":
+            conn = http.client.HTTPSConnection(host, port, timeout=cfg.http_timeout)
+        else:
+            conn = http.client.HTTPConnection(host, port, timeout=cfg.http_timeout)
+        conn.connect()
+        return conn
+
+    def get(self, cfg):
+        key = self._target(cfg)
+        store = self._store()
+        conn = store.get(key)
+        if conn is None:
+            conn = self._connect(cfg, key)
+            store[key] = conn
+        return key, conn
+
+    def drop(self, key: tuple) -> None:
+        store = self._store()
+        conn = store.pop(key, None)
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def warm(self, cfg) -> None:
+        """预热：提前完成 DNS + TCP + TLS，把握手成本移出抢单瞬间。"""
+        self.get(cfg)
+
+    def request(self, cfg, method: str, path: str, headers: dict,
+                body: Optional[bytes], timeout: float) -> tuple:
+        key, conn = self.get(cfg)
+        for attempt in (0, 1):
+            try:
+                return self._do(conn, method, path, headers, body, timeout)
+            except Exception:
+                self.drop(key)
+                if attempt:
+                    raise
+                key, conn = self._connect(cfg, key)
+                self._store()[key] = conn
+
+    @staticmethod
+    def _do(conn, method: str, path: str, headers: dict,
+            body: Optional[bytes], timeout: float) -> tuple:
+        conn.timeout = timeout
+        if conn.sock is not None:
+            try:
+                conn.sock.settimeout(timeout)
+            except Exception:
+                pass
+        started = time.monotonic()
+        conn.request(method, path, body=body, headers=headers)
+        resp = conn.getresponse()
+        raw = resp.read()
+        status = resp.status
+        try:
+            resp.close()
+        except Exception:
+            pass
+        return status, raw.decode("utf-8", "replace"), (time.monotonic() - started) * 1000.0
+
+
 # ------------------------------ Config ------------------------------
 @dataclass(frozen=True)
 class EngineConfig:
-    """不可变配置快照（契约 Config 的字段）。"""
+    """不可变配置快照。原有字段语义保持不变，新增字段均为性能/策略开关。"""
 
     base: str = "https://materials.xlya.cn"
-    poll_interval: float = 1.5
+    poll_interval: float = 0.4
     task_types: tuple = ("standard", "long_term")
     platform_account_id: Optional[int] = None
     rate_limit_max: int = 6
     rate_limit_window: float = 10.0
-    max_pages: int = 1
+    max_pages: int = 2
     page_size: int = 10
     http_timeout: float = 8
     result_polls: int = 0
+    # ---- 性能 / 策略 ----
+    claim_workers: int = 3
+    poll_rate_max: int = 5
+    poll_rate_window: float = 1.0
+    seen_ttl: float = 180.0
+    bottom_first: bool = True
+    early_fire: bool = True
 
     # ---- 序列化 ----
     def to_dict(self) -> dict:
@@ -157,6 +312,12 @@ def _number(key: str, raw: Any, *, minimum=None, maximum=None, integer: bool = F
     return value
 
 
+def _boolean(key: str, raw: Any) -> bool:
+    if not isinstance(raw, bool):
+        raise ValueError(f"{key} 必须是布尔值")
+    return raw
+
+
 def _validate_field(key: str, raw: Any) -> Any:
     if key == "base":
         if not isinstance(raw, str) or not raw.strip():
@@ -193,6 +354,18 @@ def _validate_field(key: str, raw: Any) -> Any:
         return _number(key, raw, minimum=1, maximum=120, integer=True)
     if key == "result_polls":
         return _number(key, raw, minimum=0, maximum=20, integer=True)
+    if key == "claim_workers":
+        return _number(key, raw, minimum=1, maximum=10, integer=True)
+    if key == "poll_rate_max":
+        return _number(key, raw, minimum=1, maximum=10000, integer=True)
+    if key == "poll_rate_window":
+        return _number(key, raw, minimum=0.1, maximum=3600.0)
+    if key == "seen_ttl":
+        return _number(key, raw, minimum=0, maximum=3600.0)
+    if key == "bottom_first":
+        return _boolean(key, raw)
+    if key == "early_fire":
+        return _boolean(key, raw)
     raise ValueError(f"未知配置项：{key}")
 
 
@@ -213,23 +386,32 @@ class SniperEngine:
         self._on_event = on_event
         self._emit_lock = threading.RLock()   # on_event 串行化
         self._lock = threading.RLock()        # 状态/配置/统计
-        self._lim_lock = threading.Lock()     # claim-limits 缓存
+        self._lim_lock = threading.Lock()     # claim-limits 快照
+        self._log_lock = threading.Lock()     # 日志环形缓冲
 
         self._data_dir = persist.data_dir()
         self._logger = persist.get_logger(self._data_dir)
 
         self._cfg: EngineConfig = DEFAULT_CONFIG
-        self._limiter = RateLimiter(self._cfg.rate_limit_max, self._cfg.rate_limit_window)
-        self._limiter_key = (float(self._cfg.rate_limit_max), float(self._cfg.rate_limit_window))
+        self._claim_limiter = RateLimiter(self._cfg.rate_limit_max,
+                                          self._cfg.rate_limit_window)
+        self._limiter_key = (float(self._cfg.rate_limit_max),
+                             float(self._cfg.rate_limit_window))
+        self._poll_limiter = RateLimiter(self._cfg.poll_rate_max,
+                                         self._cfg.poll_rate_window)
+        self._poll_key = (float(self._cfg.poll_rate_max),
+                          float(self._cfg.poll_rate_window))
+
+        self._http = HttpPool()
+        self._sched = ClaimScheduler()
 
         self._token: Optional[str] = None
         self._token_exp: Optional[int] = None
 
-        # 去重 / 在途
-        self._seen: set = set()
+        # 去重 / 在途 / 已领取
+        self._seen: dict = {}          # task_id -> 入队时刻（monotonic），带 TTL
         self._in_flight: set = set()
-
-        self._claim_queue: "queue.Queue[tuple]" = queue.Queue()
+        self._claimed: set = set()     # 本进程内领取成功的任务，永不再抢
 
         self._stop = threading.Event()
         self._running = False
@@ -239,7 +421,8 @@ class SniperEngine:
         self._last_poll_at: Optional[float] = None
 
         self._stats = {"polls": 0, "skipped": 0, "claims_ok": 0,
-                       "claims_fail": 0, "claims_conflict": 0}
+                       "claims_fail": 0, "claims_conflict": 0,
+                       "claims_attempted": 0, "retries": 0}
 
         self._tasks_map: dict = {}
         self._tasks_ts: Optional[float] = None
@@ -247,11 +430,27 @@ class SniperEngine:
         self._history: deque = deque(maxlen=MAX_HISTORY)
         self._logs: deque = deque(maxlen=MAX_LOGS)
 
+        # claim-limits 快照（后台线程刷新）
         self._lim_data: dict = {}
-        self._lim_ts: float = 0.0
+        self._lim_mono: float = 0.0
+        self._clock_offset_ms: float = 0.0
+        self._rtt_ms: float = 0.0
+
+        # 冷却 / 退避
+        self._next_claim_at: float = 0.0
+        self._poll_block_until: float = 0.0
+        self._cool_log_at: float = 0.0
 
         self._pollers: dict = {}          # task_type -> {"thread":Thread,"stop":Event}
-        self._claimer: Optional[threading.Thread] = None
+        self._claim_threads: list = []
+        self._claim_stops: list = []
+        self._limits_thread: Optional[threading.Thread] = None
+
+        # 异步文件日志
+        self._log_queue: "queue.Queue" = queue.Queue(maxsize=5000)
+        self._log_thread = threading.Thread(target=self._log_writer_loop,
+                                            name="sniper-log", daemon=True)
+        self._log_thread.start()
 
     # ============================ 事件 ============================
     def _emit(self, event: dict) -> None:
@@ -260,6 +459,20 @@ class SniperEngine:
                 self._on_event(event)
             except Exception:
                 pass  # 广播方出问题不能带崩引擎线程
+
+    def _log_writer_loop(self) -> None:
+        """后台把日志写盘：领取关键路径只做内存 append + 入队。"""
+        while True:
+            try:
+                entry = self._log_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            except Exception:
+                return
+            if entry is None:
+                return
+            msg, level = entry
+            self._file_log(msg, level)
 
     def _file_log(self, msg: str, level: str) -> None:
         if self._logger is None:
@@ -274,10 +487,21 @@ class SniperEngine:
     def _log(self, msg: str, level: str = "INFO") -> None:
         ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
         event = {"type": "log", "ts": ts, "level": level, "msg": msg}
-        with self._lock:
+        with self._log_lock:
             self._logs.append(event)
-        self._file_log(msg, level)
+        try:
+            self._log_queue.put_nowait((msg, level))
+        except Exception:
+            pass  # 队列满就丢弃磁盘日志，绝不阻塞抢单
         self._emit(event)
+
+    def _cool_log(self, msg: str, level: str = "INFO") -> None:
+        """高频冷却日志节流（最多 1 条/秒）。"""
+        now = time.monotonic()
+        if now - self._cool_log_at < 1.0:
+            return
+        self._cool_log_at = now
+        self._log(msg, level)
 
     def _emit_status(self) -> None:
         self._emit({"type": "status", "status": self.status()})
@@ -302,14 +526,22 @@ class SniperEngine:
             self._cfg = cfg
             key = (float(cfg.rate_limit_max), float(cfg.rate_limit_window))
             if key != self._limiter_key:
-                self._limiter = RateLimiter(cfg.rate_limit_max, cfg.rate_limit_window)
+                self._claim_limiter = RateLimiter(cfg.rate_limit_max,
+                                                  cfg.rate_limit_window)
                 self._limiter_key = key
+            poll_key = (float(cfg.poll_rate_max), float(cfg.poll_rate_window))
+            if poll_key != self._poll_key:
+                self._poll_limiter = RateLimiter(cfg.poll_rate_max,
+                                                 cfg.poll_rate_window)
+                self._poll_key = poll_key
         try:
             persist.save_config(cfg.to_dict(), self._data_dir)
         except Exception:
             pass
         if "task_types" in patch:
             self._sync_pollers(cfg)
+        if "claim_workers" in patch:
+            self._sync_workers(cfg)
         self._emit_status()
         return cfg.to_dict()
 
@@ -367,74 +599,71 @@ class SniperEngine:
             if self._started_at is None:
                 self._started_at = time.time()
             cfg = self._cfg
-        # 防御：从停止态启动前排空遗留队列（上一轮 stop 后可能有竞态残留）；
-        # 运行中重复 start 不排空，避免误杀调度中的合法任务
-        if not was_active:
-            while True:
-                try:
-                    self._claim_queue.get_nowait()
-                    self._claim_queue.task_done()
-                except queue.Empty:
-                    break
+            if not was_active:
+                # 全新一轮：清空上一轮残留的调度/去重状态
+                self._sched.clear()
+                self._in_flight.clear()
+                self._seen.clear()
+                self._next_claim_at = 0.0
+                self._poll_block_until = 0.0
         self._sync_pollers(cfg)
-        self._ensure_claimer()
+        self._sync_workers(cfg)
+        self._ensure_limits_thread()
         self._log(f"开始狙击 | 监控类型={list(cfg.task_types)} | 账号="
-                  f"{cfg.platform_account_id or '自动'} | 限速="
-                  f"{cfg.rate_limit_max}/{cfg.rate_limit_window}s", "INFO")
+                  f"{cfg.platform_account_id or '自动'} | 领取限速="
+                  f"{cfg.rate_limit_max}/{cfg.rate_limit_window}s | 轮询="
+                  f"{cfg.poll_interval}s×{cfg.max_pages}页 | 并发={cfg.claim_workers} | "
+                  f"优先={'列表尾部' if cfg.bottom_first else '列表首位'}", "INFO")
         self._emit_status()
 
     def stop(self) -> None:
-        """置停标志 + join(timeout=3) + 队列收尾。"""
+        """置停标志 + join + 清空调度队列。"""
         with self._lock:
-            was_active = self._running or bool(self._pollers) or self._claimer is not None
+            was_active = (self._running or bool(self._pollers)
+                          or bool(self._claim_threads)
+                          or self._limits_thread is not None)
             self._running = False
             self._state = "idle"
             self._state_reason = ""
             pollers = list(self._pollers.values())
             self._pollers = {}
-            claimer = self._claimer
-            self._claimer = None
+            claim_threads = list(self._claim_threads)
+            self._claim_threads = []
+            claim_stops = list(self._claim_stops)
+            self._claim_stops = []
+            limits_thread = self._limits_thread
+            self._limits_thread = None
         self._stop.set()
-        threads = [p["thread"] for p in pollers]
         for p in pollers:
             p["stop"].set()
-        if claimer is not None:
-            threads.append(claimer)
+        for ev in claim_stops:
+            ev.set()
+        threads = [p["thread"] for p in pollers] + list(claim_threads)
+        if limits_thread is not None:
+            threads.append(limits_thread)
         for t in threads:
             try:
                 t.join(timeout=3)
             except Exception:
                 pass
-        drained = 0
-        while True:  # 队列收尾
-            try:
-                self._claim_queue.get_nowait()
-            except queue.Empty:
-                break
-            else:
-                drained += 1
-                try:
-                    self._claim_queue.task_done()
-                except Exception:
-                    pass
+        dropped = self._sched.clear()
         with self._lock:
             self._in_flight.clear()
         if not was_active:
             return
-        if drained:
-            self._log(f"已停止（丢弃 {drained} 个待领取任务）", "WARN")
+        if dropped:
+            self._log(f"已停止（丢弃 {dropped} 个待领取任务）", "WARN")
         else:
             self._log("已停止", "INFO")
         self._emit_status()
 
     # ============================ 线程管理 ============================
     def _sync_pollers(self, cfg: EngineConfig) -> None:
+        to_start = []
         with self._lock:
             if not self._running:
                 return  # 未运行时不创建线程（start() 会负责）
-        wanted = list(cfg.task_types)
-        to_start = []
-        with self._lock:
+            wanted = list(cfg.task_types)
             for task_type in list(self._pollers):
                 if task_type not in wanted:
                     info = self._pollers.pop(task_type)
@@ -453,20 +682,46 @@ class SniperEngine:
         for thread in to_start:
             thread.start()
 
-    def _ensure_claimer(self) -> None:
+    def _sync_workers(self, cfg: EngineConfig) -> None:
+        """按 ``claim_workers`` 扩容/缩容领取线程。"""
+        wanted = max(1, min(10, int(cfg.claim_workers)))
+        to_start = []
         with self._lock:
-            if self._claimer is not None and self._claimer.is_alive():
+            if not self._running:
                 return
-            thread = threading.Thread(target=self._claimer_loop,
-                                      name="sniper-claimer", daemon=True)
-            self._claimer = thread
+            pairs = [(t, e) for t, e in zip(self._claim_threads, self._claim_stops)
+                     if t.is_alive()]
+            while len(pairs) > wanted:
+                _, ev = pairs.pop()
+                ev.set()
+            while len(pairs) < wanted:
+                ev = threading.Event()
+                thread = threading.Thread(
+                    target=self._worker_loop, args=(ev,),
+                    name=f"sniper-claim-{len(pairs)}", daemon=True,
+                )
+                pairs.append((thread, ev))
+                to_start.append(thread)
+            self._claim_threads = [p[0] for p in pairs]
+            self._claim_stops = [p[1] for p in pairs]
+        for thread in to_start:
+            thread.start()
+
+    def _ensure_limits_thread(self) -> None:
+        with self._lock:
+            if self._limits_thread is not None and self._limits_thread.is_alive():
+                return
+            thread = threading.Thread(target=self._limits_loop,
+                                      name="sniper-limits", daemon=True)
+            self._limits_thread = thread
         thread.start()
 
     def threads_alive(self) -> bool:
         with self._lock:
             alive = [p["thread"].is_alive() for p in self._pollers.values()]
-            if self._claimer is not None:
-                alive.append(self._claimer.is_alive())
+            alive.extend(t.is_alive() for t in self._claim_threads)
+            if self._limits_thread is not None:
+                alive.append(self._limits_thread.is_alive())
         return any(alive)
 
     # ============================ 状态查询 ============================
@@ -479,6 +734,9 @@ class SniperEngine:
             started_at = self._started_at
             last_poll_at = self._last_poll_at
             stats = dict(self._stats)
+            rtt = self._rtt_ms
+            offset = self._clock_offset_ms
+            workers = len(self._claim_threads)
         return {
             "running": running,
             "state": state,
@@ -488,6 +746,10 @@ class SniperEngine:
             "last_poll_at": last_poll_at,
             "upstream_base": cfg.base,
             "stats": stats,
+            "queue": self._sched.size(),
+            "workers": workers,
+            "rtt_ms": round(rtt, 1),
+            "clock_offset_ms": round(offset, 1),
         }
 
     def tasks(self) -> dict:
@@ -501,7 +763,7 @@ class SniperEngine:
             return list(self._history)
 
     def logs(self) -> list:
-        with self._lock:
+        with self._log_lock:
             return list(self._logs)
 
     def load_history(self, items: list) -> None:
@@ -556,47 +818,60 @@ class SniperEngine:
         self._log(f"{where}线程异常：{exc}", "ERR")
         self._emit_status()
 
+    def _note_rtt(self, rtt_ms: float) -> None:
+        if rtt_ms <= 0:
+            return
+        with self._lock:
+            self._rtt_ms = rtt_ms if self._rtt_ms <= 0 else (self._rtt_ms * 0.7 + rtt_ms * 0.3)
+
+    def _block_polling(self, seconds: float, reason: str) -> None:
+        self._poll_block_until = time.monotonic() + max(0.5, float(seconds))
+        self._cool_log(f"列表轮询退避 {seconds:.0f}s：{reason}", "WARN")
+
     # ============================ 网络层 ============================
     def _api_call(self, method: str, path: str, body: Any = None,
                   cfg: Optional[EngineConfig] = None,
-                  blocking: bool = True) -> tuple:
-        """发起一次上游调用（已纳入全局限速）。返回 (status, dict_or_None)。
+                  blocking: bool = True, kind: str = "claim") -> tuple:
+        """发起一次上游调用。返回 (status, dict_or_None)。
 
-        ``blocking=False``：拿不到令牌立即返回 ``(0, {"_skipped": True})``，
-        不发请求（列表轮询宁可跳过本轮，也不占用领取请求的额度）。
+        ``kind``：
+          - ``claim``：领取额度（阻塞拿令牌，永不丢请求）；
+          - ``poll``：轮询额度（非阻塞，拿不到就跳过本轮）；
+          - ``none``：调用方已自行拿到令牌。
+        网络层使用 keep-alive 长连接，避免每次握手。
         """
         cfg = cfg or self._cfg
         with self._lock:
             token = self._token
-            limiter = self._limiter
         if not token:
             return (0, {"_error": "未配置 token"})
-        if not limiter.try_acquire(1):
-            if not blocking:
-                return (0, {"_skipped": True})
-            limiter.acquire(1)
 
-        url = cfg.base.rstrip("/") + path
-        data = json.dumps(body).encode("utf-8") if body is not None else None
-        req = urllib.request.Request(url, data=data, method=method)
-        req.add_header("authorization", "Bearer " + token)
-        req.add_header("content-type", "application/json")
-        req.add_header("accept", "*/*")
-        req.add_header("user-agent", UA)
-        req.add_header("referer", cfg.base.rstrip("/") + "/pages/tasks/index")
-        # 故意不带 If-None-Match，避免 304 缓存影响实时性
+        limiter = None
+        if kind == "claim":
+            limiter = self._claim_limiter
+        elif kind == "poll":
+            limiter = self._poll_limiter
+        if limiter is not None:
+            if not limiter.try_acquire(1):
+                if kind == "poll" or not blocking:
+                    return (0, {"_skipped": True})
+                limiter.acquire(1)
+
+        headers = {
+            "authorization": "Bearer " + token,
+            "content-type": "application/json",
+            "accept": "*/*",
+            "user-agent": UA,
+            "referer": cfg.base.rstrip("/") + "/pages/tasks/index",
+        }
+        payload = json.dumps(body).encode("utf-8") if body is not None else None
         try:
-            with urllib.request.urlopen(req, timeout=cfg.http_timeout) as resp:
-                raw = resp.read().decode("utf-8", "replace")
-                status = resp.status
-        except urllib.error.HTTPError as exc:
-            try:
-                raw = exc.read().decode("utf-8", "replace")
-            except Exception:
-                raw = ""
-            status = exc.code
+            status, raw, rtt = self._http.request(cfg, method, path, headers,
+                                                  payload, cfg.http_timeout)
         except Exception as exc:  # 超时 / 网络错误
             return (0, {"_error": str(exc)})
+        if rtt:
+            self._note_rtt(rtt)
         try:
             obj = json.loads(raw) if raw else {}
         except Exception:
@@ -607,7 +882,7 @@ class SniperEngine:
         """返回 (status, items)。status: -1=本轮无令牌跳过, 0=网络错误。"""
         path = (f"/api/user/tasks?taskType={task_type}&page={page}"
                 f"&pageSize={cfg.page_size}&platform=&materialType=&categoryId=&keyword=")
-        status, obj = self._api_call("GET", path, cfg=cfg, blocking=False)
+        status, obj = self._api_call("GET", path, cfg=cfg, kind="poll")
         if isinstance(obj, dict) and obj.get("_skipped"):
             return (-1, [])
         if status == 0:
@@ -619,6 +894,9 @@ class SniperEngine:
             return (401, [])
         if status == 304:
             return (304, [])
+        if status == 429:
+            self._block_polling(5.0, f"列表[{task_type}] 被限流")
+            return (429, [])
         if status != 200:
             msg = obj.get("message", "") if isinstance(obj, dict) else ""
             self._log(f"列表[{task_type}] HTTP {status} {msg}", "WARN")
@@ -630,25 +908,56 @@ class SniperEngine:
                 items = data.get("items") or []
         return (200, [it for it in items if isinstance(it, dict)])
 
-    def _fetch_limits(self, cfg: EngineConfig) -> dict:
+    # ---------------- claim-limits（后台刷新，领取路径零阻塞） ----------------
+    def _limits_snapshot(self) -> dict:
+        with self._lim_lock:
+            if not self._lim_data:
+                return {}
+            if time.monotonic() - self._lim_mono > LIMITS_MAX_AGE:
+                return {}
+            return dict(self._lim_data)
+
+    def _store_limits(self, data: dict) -> None:
+        with self._lim_lock:
+            self._lim_data = dict(data or {})
+            self._lim_mono = time.monotonic()
+            try:
+                server_ms = float((data or {}).get("serverNowMs") or 0)
+            except Exception:
+                server_ms = 0.0
+            if server_ms:
+                sample = server_ms - time.time() * 1000.0
+                self._clock_offset_ms = (sample if not self._clock_offset_ms
+                                         else self._clock_offset_ms * 0.8 + sample * 0.2)
+
+    def _fetch_limits(self, cfg: EngineConfig, kind: str = "none") -> dict:
         status, obj = self._api_call("GET", "/api/user/tasks/claim-limits",
-                                     cfg=cfg, blocking=True)
+                                     cfg=cfg, kind=kind)
         if status == 401:
             self._pause("token 无效或已过期")
+            return {}
+        if status == 429:
+            self._block_polling(5.0, "配额接口被限流")
             return {}
         if status == 200 and isinstance(obj, dict):
             data = obj.get("data")
             if isinstance(data, dict):
+                self._store_limits(data)
                 return data
         return {}
 
-    def _cached_limits(self, cfg: EngineConfig, force: bool = False) -> dict:
-        with self._lim_lock:
-            now = time.monotonic()
-            if force or (now - self._lim_ts) > LIMITS_TTL:
-                self._lim_data = self._fetch_limits(cfg)
-                self._lim_ts = now
-            return self._lim_data
+    def _limits_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                if not self._is_active():
+                    self._sleep(0.2)
+                    continue
+                if self._poll_limiter.try_acquire(1):
+                    self._fetch_limits(self._cfg)
+                self._sleep(LIMITS_TTL)
+            except Exception as exc:
+                self._loop_error("配额刷新", exc)
+                self._sleep(1.0)
 
     # ============================ 平台子账号 ============================
     def platform_accounts(self, platform: Optional[str] = None) -> dict:
@@ -734,7 +1043,7 @@ class SniperEngine:
         """
         try:
             status, obj = self._api_call(
-                "GET", "/api/user/platform-accounts", cfg=self._cfg, blocking=True)
+                "GET", "/api/user/platform-accounts", cfg=self._cfg, kind="claim")
         except Exception:
             return []
         if status != 200 or not isinstance(obj, dict):
@@ -773,12 +1082,19 @@ class SniperEngine:
     # ============================ 轮询 ============================
     def _poller_loop(self, task_type: str, stop_ev: threading.Event) -> None:
         self._log(f"启动轮询线程：{task_type}", "INFO")
+        try:
+            self._http.warm(self._cfg)   # 预热连接，抢单时不做握手
+        except Exception:
+            pass
         while not self._stop.is_set() and not stop_ev.is_set():
             try:
                 if not self._is_active():
-                    self._sleep(0.25, stop_ev)
+                    self._sleep(0.2, stop_ev)
                     continue
-                cfg = self._cfg                      # 每轮取最新配置引用
+                cfg = self._cfg
+                if time.monotonic() < self._poll_block_until:
+                    self._sleep(0.2, stop_ev)
+                    continue
                 self._poll_once(task_type, cfg)
                 self._sleep(cfg.poll_interval, stop_ev)
             except Exception as exc:                 # 线程不死：日志+退避续跑
@@ -786,7 +1102,8 @@ class SniperEngine:
                 self._sleep(1.0, stop_ev)
 
     def _poll_once(self, task_type: str, cfg: EngineConfig) -> None:
-        for page in range(1, max(1, int(cfg.max_pages)) + 1):
+        pages = max(1, int(cfg.max_pages))
+        for page in range(1, pages + 1):
             if not self._is_active():
                 return
             status, items = self._get_tasks(task_type, page, cfg)
@@ -798,103 +1115,175 @@ class SniperEngine:
                 return
             self._bump("polls")
             if status == 200:
-                self._ingest(task_type, items)
+                self._ingest(task_type, items, (page - 1) * int(cfg.page_size))
                 self._clear_error()
 
-    def _ingest(self, task_type: str, items: list) -> None:
-        """合并任务快照 + 发现可领取任务入队 + 推 tasks 事件。"""
+    # ============================ 入库 / 入队 ============================
+    def _pick_account(self, item: dict) -> Optional[int]:
+        cfg = self._cfg
+        if cfg.platform_account_id:
+            try:
+                return int(cfg.platform_account_id)
+            except Exception:
+                return None
+        accounts = (item.get("claimEligibility") or {}).get("accounts") or []
+        if not accounts:
+            return None
+        first = accounts[0]
+        raw = first.get("id") if isinstance(first, dict) else first
+        try:
+            return int(raw)
+        except Exception:
+            return None
+
+    def _ingest(self, task_type: str, items: list, base_rank: int = 0) -> None:
+        """合并任务快照 + 发现可领取任务入队 + 推 tasks 事件。
+
+        入队优先级：默认 ``bottom_first=True``，即**列表越靠后越先抢**
+        （多数人习惯抢首位，尾部竞争更小）。``rank`` 用负数实现。
+        """
         new_items: list = []
-        now = time.time()
+        now = time.monotonic()
+        cfg = self._cfg
         with self._lock:
-            for item in items:
+            ttl = float(cfg.seen_ttl or 0)
+            if ttl > 0:
+                stale = [k for k, ts in self._seen.items() if now - ts >= ttl]
+                for k in stale:
+                    self._seen.pop(k, None)
+            for offset, item in enumerate(items):
                 tid = item.get("id")
                 if tid is None:
                     continue
                 self._tasks_map[tid] = item
+                if tid in self._claimed:
+                    continue          # 本进程已抢到，永不再抢
                 try:
                     quota = float(item.get("remainingQuota") or 0)
                 except Exception:
                     quota = 0.0
                 eligibility = item.get("claimEligibility") or {}
-                can_claim = bool(eligibility.get("canClaim"))
-                if (quota > 0 and can_claim
-                        and tid not in self._seen and tid not in self._in_flight):
-                    self._seen.add(tid)
-                    self._in_flight.add(tid)
-                    new_items.append(item)
+                if not (quota > 0 and bool(eligibility.get("canClaim"))):
+                    continue
+                if tid in self._seen or tid in self._in_flight:
+                    continue
+                account_id = self._pick_account(item)
+                if account_id is None:
+                    continue
+                self._seen[tid] = now
+                self._in_flight.add(tid)
+                new_items.append((item, base_rank + offset, account_id))
             self._tasks_ts = now
             self._last_poll_at = now
             snapshot = list(self._tasks_map.values())
-        for item in new_items:
-            self._claim_queue.put((item, task_type))
-            self._log(f"发现可领取任务 #{item.get('id')} [{item.get('title', '')}] -> 入队", "INFO")
+        for item, rank, account_id in new_items:
+            priority = -rank if cfg.bottom_first else rank
+            self._sched.push(item, task_type, priority, account_id, 0.0, 0)
+            self._log(f"发现可领取任务 #{item.get('id')} [{item.get('title', '')}] "
+                      f"位置={rank + 1} -> 入队", "INFO")
         self._emit_tasks(now, snapshot)
 
     # ============================ 领取 ============================
-    def _claimer_loop(self) -> None:
-        self._log("启动领取线程", "INFO")
-        while not self._stop.is_set():
+    def _worker_loop(self, stop_ev: threading.Event) -> None:
+        try:
+            self._http.warm(self._cfg)
+        except Exception:
+            pass
+        while not self._stop.is_set() and not stop_ev.is_set():
             try:
                 if not self._is_active():
-                    self._sleep(0.25)
+                    time.sleep(0.05)
                     continue
-                try:
-                    item, task_type = self._claim_queue.get(timeout=0.5)
-                except queue.Empty:
+                entry = self._sched.pop(0.25)
+                if entry is None:
                     continue
-                try:
-                    cfg = self._cfg
-                    self._claim(item, task_type, cfg)
-                    self._clear_error()
-                finally:
-                    try:
-                        self._claim_queue.task_done()
-                    except Exception:
-                        pass
+                item, task_type, account_id, attempts = entry
+                self._claim(item, task_type, account_id, attempts)
             except Exception as exc:                 # 线程不死
                 self._loop_error("领取", exc)
-                self._sleep(1.0)
+                self._sleep(0.5, stop_ev)
 
-    def _claim(self, item: dict, task_type: str, cfg: EngineConfig) -> None:
+    def _finish(self, task_id: Any) -> None:
+        with self._lock:
+            self._in_flight.discard(task_id)
+
+    def _pending_delay(self, limits: dict) -> float:
+        if not limits:
+            return 0.0
+        try:
+            pending = int(limits.get("pendingCount") or 0)
+        except Exception:
+            return 0.0
+        raw_limit = limits.get("pendingLimit")
+        if raw_limit is None:
+            return 0.0
+        try:
+            limit = int(raw_limit)
+        except Exception:
+            return 0.0
+        return 2.0 if pending >= limit else 0.0
+
+    def _cooldown_delay(self) -> float:
+        """距离可再次领取还有多少秒（含 RTT/2 提前发射补偿）。"""
+        cfg = self._cfg
+        early = (self._rtt_ms / 2000.0) if cfg.early_fire else 0.0
+        due = self._next_claim_at
+        limits = self._limits_snapshot()
+        if limits:
+            try:
+                next_allowed = float(limits.get("nextAllowedAtMs") or 0) / 1000.0
+            except Exception:
+                next_allowed = 0.0
+            if next_allowed:
+                # serverNowMs 与本地时钟的偏移：把服务端时间换算成本地时间
+                due = max(due, next_allowed - self._clock_offset_ms / 1000.0)
+        wait = due - time.time() - early
+        if wait <= 0:
+            return 0.0
+        self._cool_log(f"冷却中，{wait * 1000:.0f}ms 后再领取", "INFO")
+        return wait
+
+    def _claim(self, item: dict, task_type: str, account_id: Optional[int],
+               attempts: int) -> None:
         task_id = item.get("id")
         title = item.get("title", "")
         commission = item.get("baseCommission", "")
-        account_id: Optional[int] = None
+        cfg = self._cfg
         try:
-            limits = self._cached_limits(cfg)
-            if self._state_paused():
+            limits = self._limits_snapshot()
+
+            # 1) 待处理队列已满：延迟重排，不占用 worker
+            pending_wait = self._pending_delay(limits)
+            if pending_wait > 0:
+                if attempts < MAX_PENDING_ATTEMPTS:
+                    self._cool_log(f"待处理已满，{pending_wait:.0f}s 后重试 #{task_id}", "WARN")
+                    self._sched.push(item, task_type, 0, account_id, pending_wait, attempts + 1)
+                    self._bump("retries")
+                    return
+                self._bump("skipped")
+                self._record(task_id, title, commission, account_id, "skip", 0, "待处理已满")
+                self._finish(task_id)
                 return
-            if isinstance(limits, dict) and limits:
-                server_now = limits.get("serverNowMs") or int(time.time() * 1000)
-                next_allowed = limits.get("nextAllowedAtMs") or 0
-                if server_now < next_allowed:
-                    wait_s = (next_allowed - server_now) / 1000.0 + 0.1
-                    self._log(f"冷却中，{min(wait_s, 5):.1f}s 后再领取 #{task_id}", "WARN")
-                    self._sleep(min(wait_s, 5))
-                pending = limits.get("pendingCount") or 0
-                pending_limit = limits.get("pendingLimit")
-                if pending_limit is not None and pending >= pending_limit:
-                    self._log(f"待处理已达上限，跳过 #{task_id}", "WARN")
-                    return
 
-            if cfg.platform_account_id:
-                account_id = int(cfg.platform_account_id)
-            else:
-                accounts = (item.get("claimEligibility") or {}).get("accounts") or []
-                if not accounts:
-                    self._log(f"#{task_id} 无可领取账号，放弃", "WARN")
-                    return
-                first = accounts[0]
-                account_id = first.get("id") if isinstance(first, dict) else first
-                if account_id is None:
-                    self._log(f"#{task_id} 账号信息缺失，放弃", "WARN")
-                    return
-                account_id = int(account_id)
+            # 2) 冷却：重排到到期时刻（提前 RTT/2 发射）
+            wait = self._cooldown_delay()
+            if wait > 0:
+                self._sched.push(item, task_type, 0, account_id, wait, attempts)
+                self._bump("retries")
+                return
 
-            self._log(f"立即领取 #{task_id} [{title}] 账号={account_id} 佣金={commission}", "CLAIM")
+            if account_id is None:
+                account_id = self._pick_account(item)
+            if account_id is None:
+                self._log(f"#{task_id} 无可领取账号，放弃", "WARN")
+                self._finish(task_id)
+                return
+
+            # 3) 立即领取（日志在请求之后，关键路径不落盘）
+            self._bump("claims_attempted")
             status, obj = self._api_call(
                 "POST", f"/api/user/tasks/{task_id}/claim",
-                {"platformAccountId": account_id}, cfg=cfg, blocking=True,
+                {"platformAccountId": account_id}, cfg=cfg, kind="claim",
             )
             obj = obj if isinstance(obj, dict) else {}
 
@@ -903,6 +1292,7 @@ class SniperEngine:
                              "token 无效或已过期")
                 self._bump("claims_fail")
                 self._pause("token 无效或已过期")
+                self._finish(task_id)
                 return
 
             if status in (200, 201) and obj.get("success"):
@@ -912,55 +1302,97 @@ class SniperEngine:
                 limits_in_rec = record.get("claimLimits") or {}
                 self._bump("claims_ok")
                 self._record(task_id, title, commission, account_id, "ok", status, "领取成功")
+                with self._lock:
+                    self._claimed.add(task_id)
+                try:
+                    retry_after = float(limits_in_rec.get("retryAfterSeconds") or 0)
+                except Exception:
+                    retry_after = 0.0
+                if retry_after > 0:
+                    with self._lock:
+                        self._next_claim_at = max(self._next_claim_at,
+                                                  time.time() + retry_after)
                 self._log(
                     f"领取成功 #{task_id} 记录ID={record.get('id')} 失效={record.get('expiresAt')} "
-                    f"剩余冷却={limits_in_rec.get('retryAfterSeconds')}s", "OK")
+                    f"剩余冷却={retry_after:g}s", "OK")
                 if cfg.result_polls and int(cfg.result_polls) > 0:
                     self._poll_result(task_id, account_id, cfg)
-                try:
-                    import winsound
-                    winsound.Beep(1000, 200)
-                except Exception:
-                    pass
+                threading.Thread(target=self._beep, daemon=True).start()
                 self._emit_status()
-            elif status == 409:
+                self._finish(task_id)
+                return
+
+            if status == 409:
                 message = obj.get("message") or "已被领取"
                 self._bump("claims_conflict")
                 self._record(task_id, title, commission, account_id, "conflict", status, message)
                 self._log(f"慢了一步 #{task_id}：{message}", "WARN")
                 self._emit_status()
-            elif status == 429:
-                message = obj.get("message") or "被上游限流"
-                self._bump("claims_fail")
-                self._record(task_id, title, commission, account_id, "ratelimit", status, message)
-                self._log(f"被限流 #{task_id}，退避 2s 后重试", "ERR")
-                self._sleep(2.0)
-                # 仅在引擎仍活跃时重入队：stop 已排空队列，残留项会在下次
-                # start 时被重新领取陈旧任务（oracle gate 发现的竞态）
-                if self._is_active():
-                    self._claim_queue.put((item, task_type))
-                self._emit_status()
-            else:
-                message = obj.get("message") or ""
-                self._bump("claims_fail")
-                self._record(task_id, title, commission, account_id, "fail", status,
-                             message or "领取失败")
-                self._log(f"领取失败 #{task_id} HTTP {status} {message}", "ERR")
-                self._emit_status()
-        finally:
-            with self._lock:
-                self._in_flight.discard(task_id)
+                self._finish(task_id)
+                return
 
-    def _state_paused(self) -> bool:
-        with self._lock:
-            return self._state == "paused"
+            if status == 429:
+                message = obj.get("message") or "被上游限流"
+                backoff = min(30.0, 2.0 * (attempts + 1))
+                with self._lock:
+                    self._next_claim_at = max(self._next_claim_at,
+                                              time.time() + backoff)
+                self._bump("claims_fail")
+                if attempts < MAX_CLAIM_ATTEMPTS:
+                    self._log(f"被限流 #{task_id}，{backoff:.0f}s 后重试"
+                              f"（第 {attempts + 1} 次）", "ERR")
+                    self._sched.push(item, task_type, 0, account_id, backoff, attempts + 1)
+                    self._bump("retries")
+                    self._emit_status()
+                    return
+                self._record(task_id, title, commission, account_id, "ratelimit",
+                             status, message)
+                self._log(f"被限流 #{task_id}，已达重试上限，放弃", "ERR")
+                self._emit_status()
+                self._finish(task_id)
+                return
+
+            if status == 0 or status >= 500:
+                # 网络抖动 / 上游 5xx：短暂重试
+                if attempts < 2:
+                    self._log(f"#{task_id} 上游异常（HTTP {status}），0.3s 后重试", "WARN")
+                    self._sched.push(item, task_type, 0, account_id, 0.3, attempts + 1)
+                    self._bump("retries")
+                    return
+                message = (obj.get("_error") or obj.get("message")
+                           or f"HTTP {status}")
+                self._bump("claims_fail")
+                self._record(task_id, title, commission, account_id, "fail", status, message)
+                self._log(f"领取失败 #{task_id} {message}", "ERR")
+                self._emit_status()
+                self._finish(task_id)
+                return
+
+            message = obj.get("message") or ""
+            self._bump("claims_fail")
+            self._record(task_id, title, commission, account_id, "fail", status,
+                         message or "领取失败")
+            self._log(f"领取失败 #{task_id} HTTP {status} {message}", "ERR")
+            self._emit_status()
+            self._finish(task_id)
+        except Exception as exc:
+            self._loop_error("领取", exc)
+            self._finish(task_id)
+
+    @staticmethod
+    def _beep() -> None:
+        try:
+            import winsound
+            winsound.Beep(1000, 200)
+        except Exception:
+            pass
 
     def _poll_result(self, task_id: Any, account_id: int, cfg: EngineConfig):
         path = (f"/api/user/tasks/{task_id}/claim-result"
                 f"?platformAccountId={account_id}")
         result = None
         for _ in range(max(0, int(cfg.result_polls))):
-            status, obj = self._api_call("GET", path, cfg=cfg, blocking=True)
+            status, obj = self._api_call("GET", path, cfg=cfg, kind="claim")
             if status == 401:
                 self._pause("token 无效或已过期")
                 return None
