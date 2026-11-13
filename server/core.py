@@ -382,14 +382,17 @@ class SniperEngine:
     - ``{"type":"tasks","ts":<float>,"items":[<Task>]}``
     """
 
-    def __init__(self, on_event: Callable[[dict], None]) -> None:
+    def __init__(self, on_event: Callable[[dict], None],
+                 data_dir: Optional[Any] = None) -> None:
         self._on_event = on_event
         self._emit_lock = threading.RLock()   # on_event 串行化
         self._lock = threading.RLock()        # 状态/配置/统计
         self._lim_lock = threading.Lock()     # claim-limits 快照
         self._log_lock = threading.Lock()     # 日志环形缓冲
 
-        self._data_dir = persist.data_dir()
+        # 多账号场景下每个引擎使用自己的数据目录（token/config/history/log 隔离）
+        self._data_dir = persist.ensure_dir(data_dir) if data_dir is not None \
+            else persist.data_dir()
         self._logger = persist.get_logger(self._data_dir)
 
         self._cfg: EngineConfig = DEFAULT_CONFIG
@@ -514,6 +517,10 @@ class SniperEngine:
         self._log(msg, level)
 
     # ============================ 配置 ============================
+    def data_dir(self) -> Any:
+        """当前引擎的数据目录（多账号模式下用于隔离 token/config/history）。"""
+        return self._data_dir
+
     def snapshot(self) -> dict:
         """当前配置全量快照（dict）。"""
         return self._cfg.to_dict()

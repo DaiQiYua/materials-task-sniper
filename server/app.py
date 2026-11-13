@@ -17,10 +17,10 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sse_starlette.sse import EventSourceResponse
 
 from . import persist
-from .core import SniperEngine
 from .credentials import (PHONE_RE, CredentialStore, mask_phone,
                           normalize_phone, verify_dpapi)
-from .login import LoginBusy, LoginManager, is_upstream_error
+from .hub import EngineHub
+from .login import LoginBusy, is_upstream_error
 
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
 ALLOWED_HOSTS = {"localhost", "127.0.0.1"}
@@ -215,10 +215,11 @@ class LoginSessionIn(BaseModel):
     mode: str = "interactive"
     debug: bool = False
     target_url: Optional[str] = None
+    cred_id: Optional[int] = Field(default=None, ge=1)   # 目标登录账号（多账号时）
 
 
 # ============================ 应用 ============================
-def _engine(request: Request) -> SniperEngine:
+def _engine(request: Request) -> EngineHub:
     return request.app.state.engine
 
 
@@ -239,66 +240,47 @@ async def lifespan(app: FastAPI):
         pass
 
     bus = Broadcaster()
-    engine = SniperEngine(bus.publish)
     app.state.bus = bus
-    app.state.engine = engine
     app.state.data_dir = directory
 
-    # ---- 凭据存储 + DPAPI 加密状态（启动探测，供 UI 展示）----
-    store = CredentialStore(directory, on_log=engine.log)
-    encryption = verify_dpapi()
-    app.state.credentials = store
-    app.state.encryption = encryption
-    if not encryption.get("available"):
-        engine.log(f"凭据加密不可用：{encryption.get('detail')}", "WARN")
-
-    # ---- 登录管理（交互式会话 + 凭据直登 + 自动续登）----
-    login_manager = LoginManager(engine, bus=bus, store=store)
-    app.state.login_manager = login_manager
-    try:
-        login_manager.start_auto_renew()
-    except Exception as exc:
-        engine.log(f"自动续登线程启动失败：{exc}", "WARN")
-
-    # ---- 恢复 config.json ----
-    saved_config = None
+    # 全局配置模板（每个账号引擎启动时套用；各账号也可单独覆盖）
     try:
         saved_config = persist.load_config(directory)
     except Exception:
         saved_config = None
+
+    # ---- 凭据存储 + DPAPI 加密状态（启动探测，供 UI 展示）----
+    holder: dict = {}
+
+    def _store_log(msg: str, level: str = "INFO") -> None:
+        hub = holder.get("hub")
+        if hub is not None:
+            hub.log(msg, level)
+
+    store = CredentialStore(directory, on_log=_store_log)
+    encryption = verify_dpapi()
+    app.state.credentials = store
+    app.state.encryption = encryption
+
+    # ---- 多账号引擎枢纽：一个登录账号 = 一个独立引擎 ----
+    hub = EngineHub(bus.publish, store, directory, on_log=_store_log)
+    holder["hub"] = hub
     if saved_config:
         try:
-            engine.update_config(saved_config)
+            hub.update_config(saved_config)
         except ValueError as exc:
-            engine.log(f"config.json 含无效配置，已忽略：{exc}", "WARN")
-
-    # ---- 恢复 token.json（token 本身绝不入日志）----
-    try:
-        saved_token = persist.load_token(directory)
-    except Exception:
-        saved_token = None
-    if saved_token:
-        try:
-            engine.set_token(saved_token)
-        except ValueError:
-            engine.log("token.json 中的 token 无法解析，请在界面重新填写", "WARN")
-
-    # ---- 恢复 history.jsonl（最后 200 行）----
-    try:
-        engine.load_history(persist.load_history(directory, 200))
-    except Exception:
-        pass
+            hub.log(f"config.json 含无效配置，已忽略：{exc}", "WARN")
+    app.state.hub = hub
+    app.state.engine = hub          # 旧接口统一走 hub（聚合视图）
+    if not encryption.get("available"):
+        hub.log(f"凭据加密不可用：{encryption.get('detail')}", "WARN")
 
     try:
         yield
     finally:
-        # 关停顺序：登录会话/自动续登 → 杀残留 playwright/Edge → 引擎线程
+        # 关停顺序：续登线程 / 登录会话 → 杀残留 playwright/Edge → 各引擎线程
         try:
-            login_manager.shutdown()
-        except Exception:
-            pass
-        try:
-            engine.stop()
+            hub.shutdown()
         except Exception:
             pass
 
@@ -367,13 +349,65 @@ def get_history(request: Request) -> dict:
 
 
 @app.get("/api/platform-accounts")
-def get_platform_accounts(request: Request, platform: Optional[str] = None) -> dict:
+def get_platform_accounts(request: Request, platform: Optional[str] = None,
+                          cred_id: Optional[int] = None) -> dict:
     """已发现的平台子账号（用于抢任务的 小红书/抖音/快手 等）。
 
-    无 ``platform`` 返回全部；带值时返回该平台子集；若上游未标注平台归属，
-    则回退返回全部并置 ``fallback=True``（前端据此提示）。任何失败均无日志噪音。
+    ``cred_id`` 指定登录账号时只返回该账号 token 下的子账号（多账号必须
+    带此参数，否则各账号的子账号会被合并展示）；不带则返回全部并带
+    ``cred_id`` 归属字段。任何失败均无日志噪音。
     """
-    return _engine(request).platform_accounts(platform)
+    return _engine(request).platform_accounts(platform, cred_id)
+
+
+# ---------------------------- 多账号 ----------------------------
+@app.get("/api/accounts")
+def get_accounts(request: Request) -> dict:
+    """每个登录账号的独立运行状态（引擎、token、统计）。"""
+    return _engine(request).accounts()
+
+
+@app.post("/api/accounts/{cred_id}/start")
+def post_account_start(cred_id: int, request: Request) -> dict:
+    try:
+        status = _engine(request).start_account(cred_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"ok": True, "status": status}
+
+
+@app.post("/api/accounts/{cred_id}/stop")
+def post_account_stop(cred_id: int, request: Request) -> dict:
+    try:
+        status = _engine(request).stop_account(cred_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    return {"ok": True, "status": status}
+
+
+@app.put("/api/accounts/{cred_id}/config")
+def put_account_config(cred_id: int, patch: ConfigPatch, request: Request) -> dict:
+    changes = patch.model_dump(exclude_unset=True)
+    try:
+        if not changes:
+            return _engine(request).snapshot()
+        return _engine(request).update_account_config(cred_id, changes)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+
+@app.put("/api/accounts/{cred_id}/token")
+def put_account_token(cred_id: int, payload: TokenPatch, request: Request) -> dict:
+    try:
+        return _engine(request).set_account_token(cred_id, payload.token)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 # -------------------------- 凭据 / 登录会话 --------------------------
@@ -400,6 +434,7 @@ def post_credential(payload: CredentialIn, request: Request) -> dict:
                                                  payload.password)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
+    request.app.state.hub.sync_accounts()   # 立即创建该账号的独立引擎
     _engine(request).log(f"已添加登录凭据：{item['name'] or '未命名'}（{item['phone']}）",
                          "INFO")
     return item
@@ -410,6 +445,8 @@ def delete_credential(cred_id: int, request: Request) -> dict:
     store = request.app.state.credentials
     record = store.get(cred_id)
     deleted = store.delete(cred_id)
+    if deleted:
+        request.app.state.hub.sync_accounts()   # 停掉并移除该账号引擎
     if deleted and record is not None:
         _engine(request).log(f"已删除登录凭据：{record.get('name') or '未命名'}"
                              f"（{mask_phone(record.get('phone'))}）", "INFO")
@@ -419,10 +456,12 @@ def delete_credential(cred_id: int, request: Request) -> dict:
 @app.post("/api/credentials/{cred_id}/fetch-token")
 def post_fetch_token(cred_id: int, request: Request) -> dict:
     """用单条凭据登录取 token。失败仍 200（由 ok 区分），上游 5xx → 502。"""
-    manager = request.app.state.login_manager
     if request.app.state.credentials.get(cred_id) is None:
         raise HTTPException(status_code=404, detail="凭据不存在")
-    result = manager.fetch_one(cred_id)
+    try:
+        result = request.app.state.hub.fetch_token(cred_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="账号引擎不存在")
     upstream_error = bool(result.pop("_upstream_error", False))
     if not result.get("ok") and (upstream_error or is_upstream_error(result.get("error"))):
         raise HTTPException(status_code=502, detail=result.get("error") or "上游服务错误")
@@ -432,7 +471,7 @@ def post_fetch_token(cred_id: int, request: Request) -> dict:
 @app.post("/api/token/fetch-any")
 def post_fetch_any(request: Request) -> dict:
     """依次尝试全部凭据直到首个成功。"""
-    result = request.app.state.login_manager.fetch_any()
+    result = request.app.state.hub.fetch_any()
     result.pop("_upstream_error", None)
     return result
 
@@ -445,28 +484,30 @@ def post_login_session(payload: LoginSessionIn, request: Request) -> dict:
     base = str(_engine(request).snapshot().get("base") or "").rstrip("/")
     target = (payload.target_url or "").strip() or (base + "/pages/auth/login")
     try:
-        return request.app.state.login_manager.start_interactive(
-            target, debug=bool(payload.debug))
+        return request.app.state.hub.interactive_start(
+            target, debug=bool(payload.debug), cred_id=payload.cred_id)
     except LoginBusy as exc:
         raise HTTPException(status_code=409, detail=str(exc))
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
 
 @app.get("/api/login-session")
 def get_login_session(request: Request) -> dict:
-    return request.app.state.login_manager.status()
+    return request.app.state.hub.interactive_status()
 
 
 @app.delete("/api/login-session")
 def delete_login_session(request: Request) -> dict:
     """取消并关闭浏览器；幂等（没有会话也 200）。"""
-    manager = request.app.state.login_manager
+    hub = request.app.state.hub
     try:
-        status = manager.cancel()
+        status = hub.interactive_cancel()
     except Exception as exc:
         _engine(request).log(f"关闭登录会话失败：{exc}", "WARN")
-        status = manager.status()
+        status = hub.interactive_status()
     return {"ok": True, **status}
 
 

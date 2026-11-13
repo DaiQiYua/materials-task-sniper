@@ -14,10 +14,10 @@ const state = {
   lastTasksJson: '',
   lastHistoryJson: '',
   accounts: [],            // 登录账号（凭据）
-  platformAccounts: new Map(), // id -> {id,name,claimable,total,isDefault,platform}
-  fetchedPlatformAccounts: new Map(), // id -> {id,name,platform} 来自 /api/platform-accounts
-  activeLoginId: null,     // 本地跟踪：最后成功取 Token 的登录账号
-  expandedAccountId: null, // 手风琴：当前展开查看平台子账号的登录账号
+  accountStates: new Map(),   // cred_id -> 后端返回的该账号运行状态
+  platformByCred: new Map(),  // cred_id -> Map(id -> {id,name,claimable,total,...})
+  fetchedByCred: new Map(),   // cred_id -> Map(id -> 上游拉取到的原始记录)
+  expandedAccountId: null,    // 手风琴：当前展开查看平台子账号的登录账号
   filters: { search: '', type: 'all', onlyClaimable: false, platformAccountId: null },
 };
 
@@ -114,7 +114,21 @@ function renderStatus(s) {
   renderTokenBadge(s.token);
   renderTopStats(s);
   updateTokenBanner(s);
+  syncAccountStates(s.accounts);
   renderBoardEmpty(); // 空态下的轮询次数/频率随状态实时刷新
+}
+
+/* 把聚合 status 里的 per-account 状态同步到左侧卡片（签名变化才重绘，避免抖动） */
+function syncAccountStates(accounts) {
+  const list = Array.isArray(accounts) ? accounts : [];
+  state.accountStates = new Map(list.map((a) => [a.cred_id, a]));
+  const sig = list.map((a) => [a.cred_id, a.state, a.running,
+    a.token && a.token.valid, a.stats && a.stats.claims_ok,
+    a.stats && a.stats.polls].join(':')).join('|');
+  if (sig !== state._acctSig) {
+    state._acctSig = sig;
+    renderLoginAccounts();
+  }
 }
 
 function renderTopStats(s) {
@@ -163,26 +177,12 @@ function renderLoginAccounts() {
   const box = $('loginList');
   box.textContent = '';
 
-  // 默认展开「当前」账号（仅切换到新当前账号时自动展开，不覆盖用户手动收起）
-  if (state.expandedAccountId == null && state.activeLoginId != null
-      && state._lastAutoExpand !== state.activeLoginId) {
-    state.expandedAccountId = state.activeLoginId;
-    state._lastAutoExpand = state.activeLoginId;
-  }
-
   const frag = document.createDocumentFragment();
 
-  // 统计当前账号各平台子账号数量（概览条用）
-  const counts = { xiaohongshu: 0, douyin: 0, kuaishou: 0 };
-  for (const rec of state.platformAccounts.values()) {
-    const code = (rec.platform || '').toLowerCase();
-    if (code in counts) counts[code] += 1;
-  }
-
   for (const c of list) {
-    const isActive = state.activeLoginId === c.id;
+    const st = state.accountStates.get(c.id) || null;
     const isOpen = state.expandedAccountId === c.id;
-    const card = el('div', 'acct accordion' + (isActive ? ' active' : '') + (isOpen ? ' open' : ''));
+    const card = el('div', 'acct accordion' + (st && st.running ? ' active' : '') + (isOpen ? ' open' : ''));
 
     // ── 头部（点击展开/收起）──
     const head = el('div', 'acct-head');
@@ -196,24 +196,23 @@ function renderLoginAccounts() {
     const info = el('div', 'acct-info');
     const nameRow = el('div', 'acct-name');
     nameRow.appendChild(document.createTextNode(c.name || '未命名账号'));
-    if (isActive) nameRow.appendChild(el('span', 'now-tag', '当前'));
+    const stText = st ? (STATE_TEXT[st.state] || st.state) : '未运行';
+    nameRow.appendChild(el('span', 'acct-state st-' + (st ? st.state : 'idle'), stText));
     info.appendChild(nameRow);
     info.appendChild(el('div', 'acct-phone', c.phone || '—'));
-    const metaText = c.last_error ? `最近失败：${c.last_error}`
-      : (c.last_ok_at ? `上次成功：${fmtAgo(c.last_ok_at)}` : '从未取过 Token');
-    info.appendChild(el('div', 'acct-meta' + (c.last_error ? ' err' : ''), metaText));
+    info.appendChild(el('div', 'acct-meta' + (c.last_error ? ' err' : ''),
+      describeAccount(c, st)));
     head.appendChild(info);
 
     // ── 头部右侧操作按钮（不占独立行）──
-    if (!isActive) {
-      const btnFetch = el('button', 'mini-btn primary', '设为当前');
-      btnFetch.type = 'button';
-      btnFetch.addEventListener('click', (e) => {
-        e.stopPropagation();
-        fetchTokenById(c.id, btnFetch);
-      });
-      head.appendChild(btnFetch);
-    }
+    const btnRun = el('button', 'mini-btn primary', st && st.running ? '停止' : '启动');
+    btnRun.type = 'button';
+    btnRun.addEventListener('click', (e) => {
+      e.stopPropagation();
+      toggleAccount(c.id, !(st && st.running), btnRun);
+    });
+    head.appendChild(btnRun);
+
     const btnDel = el('button', 'mini-btn danger', '删除');
     btnDel.type = 'button';
     btnDel.addEventListener('click', (e) => { e.stopPropagation(); deleteCred(c.id); });
@@ -227,8 +226,10 @@ function renderLoginAccounts() {
     });
     card.appendChild(head);
 
-    // ── 平台概览条（每张卡常驻，避免一头沉）──
+    // ── 平台概览条：只统计本账号自己名下的子账号 ──
     const strip = el('div', 'acct-strip');
+    const mine = state.platformByCred.get(c.id) || new Map();
+    const fetched = state.fetchedByCred.has(c.id);
     for (const p of PLATFORMS) {
       const pill = el('div', 'plat-pill');
       pill.style.borderColor = p.color;
@@ -236,9 +237,9 @@ function renderLoginAccounts() {
       ico.style.background = p.color; ico.style.color = p.text;
       pill.appendChild(ico);
       pill.appendChild(el('span', 'plat-pill-name', p.name));
-      const n = isActive ? counts[p.code] : null;
+      const n = fetched ? countByPlatform(mine, p.code) : null;
       const cnt = el('span', 'plat-pill-cnt', n == null ? '—' : String(n));
-      if (isActive && n > 0) { pill.classList.add('has'); cnt.textContent = String(n); }
+      if (n > 0) pill.classList.add('has');
       pill.appendChild(cnt);
       strip.appendChild(pill);
     }
@@ -246,7 +247,7 @@ function renderLoginAccounts() {
 
     // ── 展开区：账号详情（点击查看）──
     if (isOpen) {
-      card.appendChild(renderAccountDetail(c, isActive));
+      card.appendChild(renderAccountDetail(c, st));
     }
 
     frag.appendChild(card);
@@ -265,88 +266,134 @@ function kvRow(k, v, vClass) {
   return r;
 }
 
-/* 展开后的账号详情：身份 + Token 状态 + 平台子账号 */
-function renderAccountDetail(c, isActive) {
+/* 展开后的账号详情：身份 + 本账号 Token 状态 + 本账号名下的平台子账号 */
+function renderAccountDetail(c, st) {
   const detail = el('div', 'acct-detail');
 
-  // 身份 / Token 状态（每个账号都可查看）
   const meta = el('div', 'acct-detail-meta');
   meta.appendChild(kvRow('账号ID', '#' + c.id));
   meta.appendChild(kvRow('备注名', c.name || '—'));
   meta.appendChild(kvRow('手机号', c.phone || '—'));
-  if (isActive) {
-    const tok = state.status && state.status.token;
-    if (tok && tok.present) {
-      const d = daysLeft(tok.exp);
-      meta.appendChild(kvRow('Token', tok.valid ? `有效 · 余 ${d == null ? '—' : d} 天` : '已过期', tok.valid ? 'ok' : 'err'));
-    } else {
-      meta.appendChild(kvRow('Token', '未配置', 'err'));
-    }
+  const tok = st && st.token;
+  if (tok && tok.present) {
+    const d = daysLeft(tok.exp);
+    meta.appendChild(kvRow('Token', tok.valid ? `有效 · 余 ${d == null ? '—' : d} 天` : '已过期', tok.valid ? 'ok' : 'err'));
+  } else {
+    meta.appendChild(kvRow('Token', '未配置', 'err'));
+  }
+  if (st && st.stats) {
+    meta.appendChild(kvRow('轮询 / 领取', `${st.stats.polls || 0} / ${st.stats.claims_ok || 0}`));
   }
   meta.appendChild(kvRow('上次取 Token', c.last_ok_at ? fmtAgo(c.last_ok_at) : '从未'));
   if (c.last_error) meta.appendChild(kvRow('最近错误', c.last_error, 'err'));
   detail.appendChild(meta);
 
-  // 平台子账号（仅当前账号可取数据）
-  if (isActive) {
-    const platWrap = el('div', 'acct-plat');
-    const titleRow = el('div', 'acct-plat-title-row');
-    titleRow.appendChild(el('div', 'acct-plat-title', '平台子账号 · 用于抢任务'));
-    const refresh = el('button', 'mini-btn', '刷新');
-    refresh.type = 'button';
-    refresh.addEventListener('click', (e) => { e.stopPropagation(); autoFetchPlatformAccounts(); });
-    titleRow.appendChild(refresh);
-    platWrap.appendChild(titleRow);
-    const platBox = el('div', 'acct-plat-list');
-    platWrap.appendChild(platBox);
-    detail.appendChild(platWrap);
-    renderPlatformSection(platBox);
-  } else {
-    detail.appendChild(el('div', 'acct-plat-hint',
-      '该账号尚未设为当前，无法读取其平台子账号。点右上「设为当前」后将自动拉取并展示。'));
-  }
+  // 平台子账号：只读本登录账号自己的那一份
+  const platWrap = el('div', 'acct-plat');
+  const titleRow = el('div', 'acct-plat-title-row');
+  titleRow.appendChild(el('div', 'acct-plat-title', '平台子账号 · 仅本账号名下'));
+  const refresh = el('button', 'mini-btn', '刷新');
+  refresh.type = 'button';
+  refresh.addEventListener('click', (e) => { e.stopPropagation(); fetchPlatformAccountsFor(c.id); });
+  titleRow.appendChild(refresh);
+  platWrap.appendChild(titleRow);
+  const platBox = el('div', 'acct-plat-list');
+  platWrap.appendChild(platBox);
+  detail.appendChild(platWrap);
+  renderPlatformSection(platBox, c.id);
   return detail;
 }
 
+function countByPlatform(map, code) {
+  let n = 0;
+  for (const rec of map.values()) {
+    if ((rec.platform || '').toLowerCase() === code) n += 1;
+  }
+  return n;
+}
+
+function describeAccount(c, st) {
+  if (c.last_error) return '最近失败：' + c.last_error;
+  const bits = [];
+  if (st && st.stats) {
+    bits.push(`轮询 ${st.stats.polls || 0} · 领取 ${st.stats.claims_ok || 0}`);
+  }
+  if (c.last_ok_at) bits.push('上次成功：' + fmtAgo(c.last_ok_at));
+  return bits.length ? bits.join(' · ') : '从未取过 Token';
+}
+
+async function toggleAccount(credId, run, btn) {
+  if (btn) btn.disabled = true;
+  try {
+    await api(`/api/accounts/${credId}/${run ? 'start' : 'stop'}`, { method: 'POST' });
+    toast(run ? '该账号已开始狙击（缺 Token 会自动登录）' : '该账号已停止');
+    refreshStatus();
+  } catch (err) {
+    toast(err.message || '操作失败', 'err');
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+/* 按登录账号分桶重算平台子账号：任务归属 + 该账号自己拉取的子账号 */
 function recomputePlatformAccounts() {
-  const map = new Map();
-  const defaultId = state.config && state.config.platform_account_id;
+  const byCred = new Map();
+  for (const c of state.accounts || []) byCred.set(c.id, new Map());
+
   const tasks = state._tasksCache || [];
   for (const t of tasks) {
+    const credIds = Array.isArray(t._cred_ids) && t._cred_ids.length
+      ? t._cred_ids
+      : (t._cred_id != null ? [t._cred_id] : []);
     const elig = t.claimEligibility || {};
     const accounts = Array.isArray(elig.accounts) ? elig.accounts : [];
     const can = !!elig.canClaim;
-    for (const a of accounts) {
-      const id = a.id != null ? Number(a.id) : (typeof a === 'number' ? a : null);
-      if (id == null) continue;
-      const rec = map.get(id) || { id, name: a.nickname || a.name || null, total: 0, claimable: 0, activeClaimCount: 0 };
-      rec.total += 1;
-      if (can) rec.claimable += 1;
-      map.set(id, rec);
+    for (const credId of credIds) {
+      let map = byCred.get(credId);
+      if (!map) { map = new Map(); byCred.set(credId, map); }
+      for (const a of accounts) {
+        const id = a.id != null ? Number(a.id) : (typeof a === 'number' ? a : null);
+        if (id == null) continue;
+        const rec = map.get(id) || { id, name: a.nickname || a.name || null, total: 0, claimable: 0, activeClaimCount: 0 };
+        rec.total += 1;
+        if (can) rec.claimable += 1;
+        map.set(id, rec);
+      }
     }
   }
-  // 合并「自动拉取到的平台子账号」（带名称 / 平台归属 / 进行中任务数）
-  for (const [id, rec] of state.fetchedPlatformAccounts) {
-    const existing = map.get(id) || { id, name: null, total: 0, claimable: 0, activeClaimCount: 0 };
-    existing.name = existing.name || rec.name || null;
-    if (rec.platform) existing.platform = rec.platform;
-    if (rec.platformName) existing.platformName = rec.platformName;
-    if (rec.account) existing.account = rec.account;
-    if (rec.verifyStatus) existing.verifyStatus = rec.verifyStatus;
-    if (rec.activeClaimCount != null) existing.activeClaimCount = rec.activeClaimCount;
-    map.set(id, existing);
+
+  // 只合并「该账号自己」拉取到的子账号，绝不跨账号合并
+  for (const [credId, map] of byCred) {
+    const fetched = state.fetchedByCred.get(credId);
+    if (fetched) {
+      for (const [id, rec] of fetched) {
+        const existing = map.get(id) || { id, name: null, total: 0, claimable: 0, activeClaimCount: 0 };
+        existing.name = existing.name || rec.name || null;
+        if (rec.platform) existing.platform = rec.platform;
+        if (rec.platformName) existing.platformName = rec.platformName;
+        if (rec.account) existing.account = rec.account;
+        if (rec.verifyStatus) existing.verifyStatus = rec.verifyStatus;
+        if (rec.activeClaimCount != null) existing.activeClaimCount = rec.activeClaimCount;
+        map.set(id, existing);
+      }
+    }
+    const st = state.accountStates.get(credId);
+    const defaultId = st && st.platform_account_id;
+    for (const rec of map.values()) {
+      rec.isDefault = (defaultId != null && Number(defaultId) === rec.id);
+    }
   }
-  for (const rec of map.values()) rec.isDefault = (defaultId != null && Number(defaultId) === rec.id);
-  state.platformAccounts = map;
+  state.platformByCred = byCred;
 }
 
-/* 把平台子账号渲染进指定容器（用于登录账号卡片内嵌） */
-function renderPlatformSection(box) {
+/* 把某个登录账号的平台子账号渲染进指定容器 */
+function renderPlatformSection(box, credId) {
   box.textContent = '';
   const frag = document.createDocumentFragment();
   const selected = state.filters.platformAccountId;
+  const map = state.platformByCred.get(credId) || new Map();
 
-  const entries = Array.from(state.platformAccounts.values())
+  const entries = Array.from(map.values())
     .sort((a, b) => (b.activeClaimCount || 0) - (a.activeClaimCount || 0));
   for (const rec of entries) {
     const card = el('div', 'pacct nested' + (selected === rec.id ? ' selected' : ''));
@@ -396,7 +443,7 @@ function renderPlatformSection(box) {
     defBtn.type = 'button';
     defBtn.addEventListener('click', (e) => {
       e.stopPropagation();
-      setDefaultAccount(rec.isDefault ? null : rec.id);
+      setDefaultAccount(rec.isDefault ? null : rec.id, credId);
     });
     card.appendChild(defBtn);
 
@@ -414,7 +461,7 @@ function renderPlatformSection(box) {
     row.appendChild(el('span', 'pacct-empty', '暂无平台子账号数据'));
     const btn = el('button', 'mini-btn', '立即获取');
     btn.type = 'button';
-    btn.addEventListener('click', (e) => { e.stopPropagation(); autoFetchPlatformAccounts(); });
+    btn.addEventListener('click', (e) => { e.stopPropagation(); fetchPlatformAccountsFor(credId); });
     row.appendChild(btn);
     box.appendChild(row);
   }
@@ -554,6 +601,15 @@ function renderTaskBoard() {
       card.appendChild(eligWrap);
     }
 
+    // 多登录账号可见性（任务列表已按 taskId 去重，这里说明有几个登录账号看到了它）
+    const credIds = Array.isArray(t._cred_ids) ? t._cred_ids : [];
+    if (credIds.length) {
+      const byline = el('div', 'task-accts');
+      byline.title = '该任务由这些登录账号轮询可见；可领取账号为并集';
+      byline.appendChild(el('span', 'task-acct-label', `${credIds.length} 个登录账号可见`));
+      card.appendChild(byline);
+    }
+
     // 底部：领取状态
     const foot = el('div', 'task-foot');
     const badgeEl = el('span', 'claim-badge ' + (can ? 'ok' : 'off'), can ? '可领取' : '不可领');
@@ -612,6 +668,7 @@ function renderHistory(items) {
 
     const meta = el('div', 'hist-meta');
     meta.appendChild(el('span', null, (h.ts != null ? String(h.ts).replace('T', ' ') : '—')));
+    if (h.account) meta.appendChild(el('span', 'hist-acct', h.account));
     if (h.account_id != null) meta.appendChild(el('span', null, '账号 #' + h.account_id));
     if (h.commission != null) { const b = el('span'); b.appendChild(document.createTextNode('佣金 ')); b.appendChild(el('b', null, String(h.commission))); meta.appendChild(b); }
     if (h.http != null) meta.appendChild(el('span', null, 'HTTP ' + h.http));
@@ -632,6 +689,7 @@ function appendLogEntry(l, animate) {
   const line = el('div', 'log-line lv-' + level.toLowerCase() + (animate ? ' fresh' : ''));
   line.appendChild(el('span', 'log-ts', l.ts || ''));
   line.appendChild(el('span', 'log-lv', level));
+  if (l.account) line.appendChild(el('span', 'log-acct', l.account));
   line.appendChild(el('span', 'log-msg', l.msg != null ? String(l.msg) : ''));
   list.appendChild(line);
   while (list.children.length > LOG_CAP) list.removeChild(list.firstChild);
@@ -724,14 +782,15 @@ function renderCreds(data) {
     note.textContent = '凭据已加密存储';
   }
 
-  // 若 token 已存在但本地未记录「当前」账号，自动选最近成功取过 Token 的账号
-  if (state.activeLoginId == null && state.status && state.status.token && state.status.token.present) {
+  // 默认展开：最近成功取过 Token 的账号（仅首次，后续尊重用户手动收起）
+  if (state.expandedAccountId == null && state._lastAutoExpand !== true) {
     let best = null;
     for (const c of items) {
       if (!c.last_ok_at) continue;
       if (!best || (c.last_ok_at || 0) > (best.last_ok_at || 0)) best = c;
     }
-    if (best) state.activeLoginId = best.id;
+    if (best) state.expandedAccountId = best.id;
+    state._lastAutoExpand = true;
   }
 
   renderLoginAccounts(); // 同步左侧账号列表
@@ -764,12 +823,10 @@ async function fetchTokenById(id, btn) {
   try {
     const r = await api(`/api/credentials/${id}/fetch-token`, { method: 'POST' });
     if (r && r.ok) {
-      state.activeLoginId = id;
       state.expandedAccountId = id;
-      toast(`Token 已获取（${r.phone || '账号'}）· 已设为当前`);
-      renderLoginAccounts();
+      toast(`Token 已获取（${r.phone || '账号'}）`);
       refreshStatus();
-      autoFetchPlatformAccounts();
+      await fetchPlatformAccountsFor(id);
     } else {
       toast('取 Token 失败：' + ((r && r.error) || '未知错误'), 'err');
     }
@@ -788,7 +845,7 @@ async function onFetchAny() {
     if (r && r.ok) {
       toast(`Token 已获取（${r.phone || '账号'}）`);
       refreshStatus();
-      autoFetchPlatformAccounts();
+      await autoFetchPlatformAccounts();
     } else {
       const n = (r && r.attempts && r.attempts.length) || 0;
       toast(`全部失败（${n} 个账号）：` + ((r && r.error) || ''), 'err');
@@ -804,55 +861,64 @@ async function deleteCred(id) {
   if (!confirm('删除该账号？（需重新添加才能再取 Token）')) return;
   try {
     await api(`/api/credentials/${id}`, { method: 'DELETE' });
+    state.fetchedByCred.delete(id);
+    state.platformByCred.delete(id);
+    if (state.expandedAccountId === id) state.expandedAccountId = null;
     toast('已删除');
     await loadCreds();
+    recomputePlatformAccounts();
+    renderLoginAccounts();
+    refreshStatus();
   } catch (err) {
     toast('删除失败：' + err.message, 'err');
   }
 }
 
-/* ── 配置：设置默认领取账号 ── */
-async function setDefaultAccount(accountId) {
+/* ── 配置：设置某个登录账号的默认领取子账号 ── */
+async function setDefaultAccount(accountId, credId) {
   try {
-    const c = await api('/api/config', { method: 'PUT', body: JSON.stringify({ platform_account_id: accountId }) });
-    state.config = c;
+    await api(`/api/accounts/${credId}/config`, {
+      method: 'PUT',
+      body: JSON.stringify({ platform_account_id: accountId }),
+    });
     recomputePlatformAccounts();
     renderLoginAccounts();
-    toast(accountId == null ? '已清除默认领取账号' : `默认领取账号 → #${accountId}`);
+    toast(accountId == null ? '已清除该账号的默认领取' : `该账号默认领取 → #${accountId}`);
   } catch (err) {
     toast('设置失败：' + err.message, 'err');
   }
 }
 
-/* ── 平台子账号数据拉取（展示在左侧账号卡片中） ── */
-async function fetchPlatformAccountsFor(p) {
+/* ── 平台子账号数据拉取：每个登录账号各拉各的，互不合并 ── */
+async function fetchPlatformAccountsFor(credId) {
   try {
-    const data = await api('/api/platform-accounts?platform=' + encodeURIComponent(p.code));
+    const data = await api('/api/platform-accounts?cred_id=' + encodeURIComponent(credId));
     const items = (data && data.items) || [];
-    // 合并到缓存，刷新左栏账号卡片内嵌的平台子账号
+    const map = new Map();
     for (const a of items) {
       const id = a.id != null ? Number(a.id) : NaN;
       if (isNaN(id)) continue;
-      const prev = state.fetchedPlatformAccounts.get(id);
-      state.fetchedPlatformAccounts.set(id, {
+      map.set(id, {
         id,
-        name: a.name || (prev && prev.name) || null,
-        platform: a.platform || p.code,
-        platformName: a.platformName || (prev && prev.platformName) || null,
-        account: a.account || (prev && prev.account) || null,
-        verifyStatus: a.verifyStatus || (prev && prev.verifyStatus) || null,
-        total: a.total != null ? a.total : (prev && prev.total),
-        claimable: a.claimable != null ? a.claimable : (prev && prev.claimable),
-        activeClaimCount: a.activeClaimCount != null ? a.activeClaimCount : (prev && prev.activeClaimCount),
+        name: a.name || null,
+        platform: a.platform || null,
+        platformName: a.platformName || null,
+        account: a.account || null,
+        verifyStatus: a.verifyStatus || null,
+        total: a.total || 0,
+        claimable: a.claimable || 0,
+        activeClaimCount: a.activeClaimCount,
       });
     }
+    state.fetchedByCred.set(credId, map);   // 整体覆盖，绝不与其它账号叠在一起
     recomputePlatformAccounts();
     renderLoginAccounts();
   } catch (_) { /* 拉取失败静默，保留已有缓存 */ }
 }
 
 async function autoFetchPlatformAccounts() {
-  await Promise.all(PLATFORMS.map((p) => fetchPlatformAccountsFor(p)));
+  const ids = (state.accounts || []).map((c) => c.id);
+  await Promise.all(ids.map((id) => fetchPlatformAccountsFor(id)));
 }
 
 /* ── 启动 / 停止 ── */
@@ -980,10 +1046,8 @@ function initTheme() {
     toast('初始化加载失败：' + err.message, 'err');
   }
   await loadCreds();
-  // Token 已存在时自动拉取平台子账号（否则刷新页面后左栏看不到子平台信息）
-  if (state.status && state.status.token && state.status.token.present) {
-    autoFetchPlatformAccounts();
-  }
+  // 每个登录账号各自拉取自己名下的平台子账号（互不合并）
+  if ((state.accounts || []).length) await autoFetchPlatformAccounts();
 
   connectSSE();
 
