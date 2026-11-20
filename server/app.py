@@ -3,9 +3,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import queue
 import threading
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Optional
@@ -17,7 +19,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sse_starlette.sse import EventSourceResponse
 
 from . import persist
-from .core import SniperEngine
+from .core import PLATFORM_CACHE_STALE_SECONDS, SniperEngine, jwt_exp
 from .credentials import (PHONE_RE, CredentialStore, mask_phone,
                           normalize_phone, verify_dpapi)
 from .login import LoginBusy, LoginManager, is_upstream_error
@@ -142,12 +144,29 @@ class ConfigPatch(BaseModel):
     http_timeout: Optional[float] = Field(default=None, ge=1, le=120)
     result_polls: Optional[int] = Field(default=None, ge=0, le=20)
     # ---- 性能 / 策略 ----
-    claim_workers: Optional[int] = Field(default=None, ge=1, le=10)
+    # 上限 20 与 core.EngineConfig._validate_field 保持一致：此前这里写 le=10，
+    # 而引擎允许 1~20，导致 PUT claim_workers=15 被 API 层 422（文档却写 1~20）。
+    claim_workers: Optional[int] = Field(default=None, ge=1, le=20)
     poll_rate_max: Optional[int] = Field(default=None, ge=1, le=10000)
     poll_rate_window: Optional[float] = Field(default=None, ge=0.1, le=3600)
     seen_ttl: Optional[float] = Field(default=None, ge=0, le=3600)
     bottom_first: Optional[bool] = None
     early_fire: Optional[bool] = None
+    # ---- 多账号并发 / 最新任务 ----
+    # 这四项引擎侧一直支持（EngineConfig 有字段、_validate_field 有校验），
+    # 但 ConfigPatch 因 extra="forbid" 没声明它们，于是 README 里承诺可用的
+    # PUT /api/config 实际返回 422。这里补齐，边界与引擎保持一致。
+    newest_first: Optional[bool] = None
+    tail_pages: Optional[int] = Field(default=None, ge=1, le=10)
+    total_refresh_seconds: Optional[float] = Field(default=None, ge=1.0, le=3600)
+    per_account_inflight: Optional[int] = Field(default=None, ge=1, le=5)
+    # ---- 轮询成本 ----
+    single_poller: Optional[bool] = None
+    poll_rotate_seconds: Optional[float] = Field(default=None, ge=0, le=3600)
+    # ---- 调试 / 抓包 ----
+    #: 上游请求代理（如 http://127.0.0.1:9090）；null/空串 = 直连。
+    #: 具体规范化与校验由引擎侧 EngineConfig._validate_field 统一做，这里不加 validator。
+    proxy: Optional[str] = None
 
     @field_validator("base")
     @classmethod
@@ -217,6 +236,14 @@ class LoginSessionIn(BaseModel):
     target_url: Optional[str] = None
 
 
+class DataClearIn(BaseModel):
+    """POST /api/data/clear：``confirm`` 必须为「清空」，错词 → 400 且不删任何文件。"""
+
+    model_config = ConfigDict(extra="ignore")
+
+    confirm: str = ""
+
+
 # ============================ 应用 ============================
 def _engine(request: Request) -> SniperEngine:
     return request.app.state.engine
@@ -228,6 +255,81 @@ def _bus(request: Request) -> Broadcaster:
 
 def _sse_frame(payload: Any) -> bytes:
     return ("data: " + json.dumps(payload, ensure_ascii=False) + "\n\n").encode("utf-8")
+
+
+def _stale_platform_cache(fetched_at: Any, now: Optional[float] = None) -> bool:
+    """缓存是否过期：无 ``fetched_at`` 或早于 6 小时前 → True。"""
+    if isinstance(fetched_at, bool) or not isinstance(fetched_at, (int, float)):
+        return True
+    base = time.time() if now is None else float(now)
+    return (base - float(fetched_at)) > PLATFORM_CACHE_STALE_SECONDS
+
+
+def _pick_migration_cred(records: list) -> Optional[dict]:
+    """推断旧全局 Token 属于哪个账号：``last_ok_at`` 最大者；全空取 id 最小。"""
+    candidates = [r for r in records if isinstance(r, dict) and r.get("last_ok_at")]
+    if candidates:
+        try:
+            return max(candidates,
+                       key=lambda r: (float(r.get("last_ok_at") or 0),
+                                      -int(r.get("id") or 0)))
+        except Exception:
+            return candidates[0]
+    if not records:
+        return None
+    try:
+        return min(records, key=lambda r: int(r.get("id") or 0))
+    except Exception:
+        return records[0]
+
+
+def _migrate_legacy_token(engine: SniperEngine, store: CredentialStore,
+                          directory: Path) -> None:
+    """把旧的**全局** token（``token.json``）一次性迁移到某一个账号名下。
+
+    条件全部满足才动作：
+      ① ``tokens.json`` 为空（不存在或没有任何条目）；
+      ② ``token.json`` 里有 token 且未过期；
+      ③ ``credentials.json`` 里至少有一条凭据。
+    幂等：``tokens.json`` 已有内容时直接返回，绝不覆盖、不重复迁移。
+    迁移后立即用该 token 拉一次平台子账号写缓存（失败只记错误，不影响启动）。
+    """
+    if persist.load_tokens(directory):
+        return                                    # 幂等：已迁移过
+    try:
+        token = persist.load_token(directory)
+    except Exception:
+        token = None
+    if not token:
+        return
+    exp = jwt_exp(token)
+    if exp is not None and exp <= time.time():
+        engine.log("token.json 里的旧 Token 已过期，跳过一次性迁移", "WARN")
+        return
+    records = [r for r in store.list_all() if isinstance(r, dict)]
+    if not records:
+        return
+    target = _pick_migration_cred(records)
+    if target is None:
+        return
+    try:
+        cid = int(target.get("id"))
+    except Exception:
+        return
+    store.set_token(cid, token, exp=exp, adopted=True)
+    engine.log(f"旧全局 Token 已迁移到账号 #{cid}（按最近成功登录时间推断）", "INFO")
+    # 首屏体验：立刻用该 token 拉一次平台子账号并写缓存
+    try:
+        result = engine.platform_accounts_for_cred(cid, refresh=True)
+    except Exception as exc:
+        engine.log(f"迁移后拉取平台子账号失败：{exc}", "WARN")
+        return
+    error = (result or {}).get("error") if isinstance(result, dict) else None
+    if error:
+        engine.log(f"迁移后拉取平台子账号失败：{error}（启动不受影响）", "WARN")
+    else:
+        count = len((result or {}).get("items") or [])
+        engine.log(f"已为账号 #{cid} 拉取平台子账号：{count} 个", "INFO")
 
 
 @asynccontextmanager
@@ -249,12 +351,15 @@ async def lifespan(app: FastAPI):
     encryption = verify_dpapi()
     app.state.credentials = store
     app.state.encryption = encryption
+    engine.attach_credentials(store)      # 引擎按 cred 取 token / 写平台缓存
     if not encryption.get("available"):
         engine.log(f"凭据加密不可用：{encryption.get('detail')}", "WARN")
 
     # ---- 登录管理（交互式会话 + 凭据直登 + 自动续登）----
     login_manager = LoginManager(engine, bus=bus, store=store)
     app.state.login_manager = login_manager
+    # 引擎的 401 自动重登钩子：只更新该账号自己的 token，不切活跃 token
+    engine.attach_relogin(login_manager.relogin_cred)
     try:
         login_manager.start_auto_renew()
     except Exception as exc:
@@ -283,11 +388,76 @@ async def lifespan(app: FastAPI):
         except ValueError:
             engine.log("token.json 中的 token 无法解析，请在界面重新填写", "WARN")
 
+    # ---- 若没有可用的轮询 Token，自动采用某个账号的有效 Token（不再需要「设为当前」）----
+    tok_status = engine.token_status()
+    if not tok_status.get("present") or not tok_status.get("valid"):
+        try:
+            stored_tokens = persist.load_tokens(directory) or {}
+        except Exception:
+            stored_tokens = {}
+        picked = None
+        for cid, rec in stored_tokens.items():
+            if not isinstance(rec, dict):
+                continue
+            token = rec.get("token")
+            if not isinstance(token, str) or not token.strip():
+                continue
+            exp = rec.get("exp")
+            try:
+                exp_num = int(exp) if exp is not None else 0
+            except Exception:
+                exp_num = 0
+            if exp_num and exp_num <= int(time.time()):
+                continue                              # 过期 Token 不采用
+            try:
+                saved_at = float(rec.get("saved_at") or 0)
+            except Exception:
+                saved_at = 0.0
+            score = (exp_num, saved_at)
+            if picked is None or score > picked[0]:
+                picked = (score, token, cid)
+        if picked is not None:
+            try:
+                engine.set_token(picked[1])
+                engine.log(f"未发现轮询 Token，已自动采用账号 #{picked[2]} 的 Token", "INFO")
+            except ValueError:
+                engine.log("tokens.json 中的 Token 无法解析，跳过自动采用", "WARN")
+
     # ---- 恢复 history.jsonl（最后 200 行）----
     try:
         engine.load_history(persist.load_history(directory, 200))
     except Exception:
         pass
+
+    # ---- 平台子账号缓存 → 归属索引（account_id -> cred_id）----
+    try:
+        engine.refresh_platform_index()
+    except Exception as exc:
+        engine.log(f"平台子账号归属索引重建失败：{exc}", "WARN")
+
+    # ---- 一次性旧全局 Token 迁移（token.json → tokens.json）----
+    try:
+        _migrate_legacy_token(engine, store, directory)
+    except Exception as exc:
+        engine.log(f"旧 Token 迁移失败（可忽略）：{exc}", "WARN")
+
+    # ---- 启动后低优先补一次领取记录：恢复任务冷却 / 待提交（best effort）----
+    def _startup_sync_claims() -> None:
+        time.sleep(1.5)
+        for record in store.list_all():
+            try:
+                cid = int(record.get("id"))
+                if store.get_token(cid):
+                    engine.sync_claims_for_cred(cid)
+            except Exception:
+                pass
+            time.sleep(0.3)
+
+    try:
+        threading.Thread(target=_startup_sync_claims, daemon=True,
+                         name="claims-sync").start()
+    except Exception as exc:
+        engine.log(f"启动领取记录同步失败（可忽略）：{exc}", "WARN")
 
     try:
         yield
@@ -355,6 +525,41 @@ def post_stop(request: Request) -> dict:
     return {"ok": True, "status": _engine(request).status()}
 
 
+# ------------------------- 一键清空（恢复出厂） -------------------------
+@app.post("/api/data/clear")
+def post_clear_data(payload: DataClearIn, request: Request) -> dict:
+    """清空所有数据：账号 / Token / 平台缓存 / 历史 / 日志 / 配置（恢复默认）。
+
+    ``confirm`` 必须是「清空」二字；否则 400 且**不删除任何文件**。
+    """
+    if (payload.confirm or "").strip() != "清空":
+        raise HTTPException(status_code=400, detail="请输入「清空」以确认清空操作")
+    engine = _engine(request)
+    # 先关掉可能开着的 Playwright 登录浏览器；失败只记日志，绝不 500
+    manager = getattr(request.app.state, "login_manager", None)
+    if manager is not None:
+        try:
+            manager.cancel()
+        except Exception as exc:
+            try:
+                engine.log(f"清空前关闭登录会话失败（已忽略）：{exc}", "WARN")
+            except Exception:
+                pass
+    cleared = engine.clear_all_data()
+    # 让其它标签页立即同步为空（前端已支持 snapshot 事件）
+    try:
+        _bus(request).publish({
+            "type": "snapshot",
+            "status": engine.status(),
+            "tasks": engine.tasks(),
+            "history": engine.history(),
+            "logs": engine.logs(),
+        })
+    except Exception:
+        pass
+    return {"ok": True, "cleared": cleared}
+
+
 # ---------------------------- 任务 / 历史 ----------------------------
 @app.get("/api/tasks")
 def get_tasks(request: Request) -> dict:
@@ -372,8 +577,93 @@ def get_platform_accounts(request: Request, platform: Optional[str] = None) -> d
 
     无 ``platform`` 返回全部；带值时返回该平台子集；若上游未标注平台归属，
     则回退返回全部并置 ``fallback=True``（前端据此提示）。任何失败均无日志噪音。
+    本接口**保持旧语义**（引擎活跃 token + 原返回结构）。
     """
     return _engine(request).platform_accounts(platform)
+
+
+@app.get("/api/platform-accounts/by-login")
+def get_platform_accounts_by_login(request: Request) -> dict:
+    """按登录账号分组的平台子账号（**只用缓存**，不触发任何上游请求）。
+
+    响应：``{"items": {"<cred_id>": {...}}, "missing_token": [int...],
+    "default_platform_account_id": int|None, "default_owner_cred_id": int|None}``。
+    每个凭据都出现在 ``items`` 里（没缓存的给空 items + ``stale=true``）。
+    """
+    engine = _engine(request)
+    store = request.app.state.credentials
+    directory = request.app.state.data_dir
+    try:
+        cache = persist.load_platform_cache(directory)
+    except Exception:
+        cache = {}
+    now = time.time()
+    items: dict = {}
+    missing_token: list = []
+    for record in store.list_all():
+        cid = int(record["id"])
+        info = store.get_token_info(cid) or {}
+        if not info.get("token"):
+            missing_token.append(cid)
+        entry = cache.get(cid) or {}
+        fetched_at = entry.get("fetched_at")
+        accounts = engine._merge_cooldowns(entry.get("items") or [], cid)
+        items[str(cid)] = {
+            "fetched_at": fetched_at,
+            "stale": _stale_platform_cache(fetched_at, now),
+            "fallback": bool(entry.get("fallback")),
+            "count": len(accounts),
+            "items": accounts,
+            "adopted": bool(info.get("adopted")),
+        }
+
+    default_id = engine.snapshot().get("platform_account_id")
+    default_owner = engine.owner_of_platform_account(default_id) if default_id else None
+    return {
+        "items": items,
+        "missing_token": missing_token,
+        "default_platform_account_id": default_id,
+        "default_owner_cred_id": default_owner,
+    }
+
+
+@app.get("/api/cooldowns")
+def get_cooldowns(request: Request) -> dict:
+    """冷却 / 待提交 / 可领状态明细（核对用）。
+
+    返回 ``{"now", "request", "tasks", "pending", "eligibility", "claim_limits"}``：
+    - ``request``：登录账号级领取请求冷却（10s，来自 claim-limits / 领取响应）
+    - ``tasks``  ：任务级冷却（同任务 ``claimIntervalDays``，通常 3 天）
+    - ``pending``：领取后未提交（真实阻塞继续领取的原因）
+    - ``eligibility``：从任务快照推导的「子账号 × 任务类型」可领/冷却/待提交
+    - ``claim_limits``：当前上游 claim-limits 快照
+    """
+    return _engine(request).cooldown_state()
+
+
+@app.post("/api/platform-accounts/refresh-all")
+async def post_refresh_all_platform_accounts(request: Request) -> dict:
+    """对**所有有 token 的账号串行**刷新平台子账号（每个之间 sleep 0.3s）。"""
+    engine = _engine(request)
+    store = request.app.state.credentials
+    started = time.monotonic()
+    results: dict = {}
+    for record in store.list_all():
+        cid = int(record["id"])
+        if not store.get_token(cid):
+            continue                     # 没 token 的账号跳过（missing_token 里可见）
+        result = await asyncio.to_thread(engine.platform_accounts_for_cred, cid, True)
+        if not isinstance(result, dict):
+            result = {}
+        accounts = result.get("items") or []
+        results[str(cid)] = {
+            "ok": not result.get("error"),
+            "error": result.get("error"),
+            "count": len(accounts),
+        }
+        await asyncio.sleep(0.3)         # 串行 + 间隔，避免连环打上游
+    return {"items": results,
+            "took_ms": int((time.monotonic() - started) * 1000)}
 
 
 # -------------------------- 凭据 / 登录会话 --------------------------
@@ -402,31 +692,90 @@ def post_credential(payload: CredentialIn, request: Request) -> dict:
         raise HTTPException(status_code=422, detail=str(exc))
     _engine(request).log(f"已添加登录凭据：{item['name'] or '未命名'}（{item['phone']}）",
                          "INFO")
+    try:
+        _engine(request).refresh_pollers()
+    except Exception:
+        pass
     return item
 
 
 @app.delete("/api/credentials/{cred_id}")
 def delete_credential(cred_id: int, request: Request) -> dict:
     store = request.app.state.credentials
+    engine = _engine(request)
     record = store.get(cred_id)
-    deleted = store.delete(cred_id)
+    deleted = store.delete(cred_id)      # 级联清理 tokens.json / 平台缓存
+    if deleted:
+        # 归属索引里可能还留着已删账号的子账号 → 立刻重建
+        try:
+            engine.refresh_platform_index()
+        except Exception:
+            pass
+        try:
+            engine.refresh_pollers()
+        except Exception:
+            pass
     if deleted and record is not None:
-        _engine(request).log(f"已删除登录凭据：{record.get('name') or '未命名'}"
-                             f"（{mask_phone(record.get('phone'))}）", "INFO")
+        engine.log(f"已删除登录凭据：{record.get('name') or '未命名'}"
+                   f"（{mask_phone(record.get('phone'))}）", "INFO")
     return {"ok": True, "id": cred_id, "deleted": bool(deleted)}
 
 
 @app.post("/api/credentials/{cred_id}/fetch-token")
-def post_fetch_token(cred_id: int, request: Request) -> dict:
-    """用单条凭据登录取 token。失败仍 200（由 ok 区分），上游 5xx → 502。"""
+def post_fetch_token(cred_id: int, request: Request, activate: bool = True) -> dict:
+    """用单条凭据登录取 token。失败仍 200（由 ok 区分），上游 5xx → 502。
+
+    ``activate``（默认 ``true``，**旧行为不变**）：是否把拿到的 token 设为引擎
+    活跃 Token 并写 ``token.json``；``false`` 时只更新该账号自己的
+    ``tokens.json``，响应新增 ``platform_accounts`` / ``platform_error``。
+    """
     manager = request.app.state.login_manager
     if request.app.state.credentials.get(cred_id) is None:
         raise HTTPException(status_code=404, detail="凭据不存在")
-    result = manager.fetch_one(cred_id)
+    result = manager.fetch_one(cred_id, activate=activate)
     upstream_error = bool(result.pop("_upstream_error", False))
     if not result.get("ok") and (upstream_error or is_upstream_error(result.get("error"))):
         raise HTTPException(status_code=502, detail=result.get("error") or "上游服务错误")
+    result.setdefault("platform_accounts", [])
+    result.setdefault("platform_error", None)
+    try:
+        _engine(request).refresh_pollers()
+    except Exception:
+        pass
     return result
+
+
+@app.post("/api/credentials/{cred_id}/refresh-platform-accounts")
+def post_refresh_platform_accounts(cred_id: int, request: Request) -> dict:
+    """刷新单个账号名下的全部平台子账号（一次上游调用，结果写缓存）。"""
+    engine = _engine(request)
+    if request.app.state.credentials.get(cred_id) is None:
+        raise HTTPException(status_code=404, detail="凭据不存在")
+    result = engine.platform_accounts_for_cred(cred_id, refresh=True)
+    if not isinstance(result, dict):
+        result = {}
+    accounts = result.get("items")
+    if not isinstance(accounts, list):
+        accounts = []
+    return {
+        "ok": not result.get("error"),
+        "items": accounts,
+        "fallback": bool(result.get("fallback")),
+        "fetched_at": result.get("fetched_at"),
+        "error": result.get("error"),
+        "count": len(accounts),
+    }
+
+
+@app.post("/api/credentials/{cred_id}/sync-claims")
+def post_sync_claims(cred_id: int, request: Request) -> dict:
+    """用该账号 Token 拉一次领取记录，补「任务冷却 / 待提交」。
+
+    没有任务下发、或账号在其他工具领取过时使用；低频调用，可手动触发。
+    """
+    if request.app.state.credentials.get(cred_id) is None:
+        raise HTTPException(status_code=404, detail="凭据不存在")
+    return _engine(request).sync_claims_for_cred(cred_id)
 
 
 @app.post("/api/token/fetch-any")

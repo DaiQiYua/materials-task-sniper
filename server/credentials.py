@@ -1,7 +1,12 @@
 # -*- coding: utf-8 -*-
 """凭据存储（``credentials.json``）。
 
-字段：``{id, name, phone, password_enc, last_ok_at, last_error}``（自增 id）。
+字段：``{id, name, phone, password_enc, last_ok_at, last_error,
+last_platform_error}``（自增 id）。
+
+每个账号的 token **不在** ``credentials.json`` 里，而是单独落在
+``tokens.json``（见 ``persist.load_tokens``）：token 与密码同级别敏感，
+分文件便于整文件收紧权限，也避免把 JWT 混进凭据列表接口。
 
 密码加密
 --------
@@ -196,6 +201,18 @@ class CredentialStore:
         self._lock = threading.RLock()
         self.on_log = on_log
         self._warned_plain = False
+        # ---- 内存快照缓存 ----
+        # 为什么需要：引擎每轮轮询 / 每次领取都会调 get_token() 与 list_all()，
+        # 每次都 json.loads 读盘；_limits_loop 每 0.5s 又遍历一遍，读盘被放大到
+        # 每秒数十次。命中缓存时直接返回**副本**（避免调用方改到缓存对象），
+        # 2s 的 TTL 足以吃掉这些重复读，又不会让外部改文件后「太久看不到」。
+        self._items_cache: Optional[dict] = None
+        self._items_at = 0.0
+        self._tokens_cache: Optional[dict] = None
+        self._tokens_at = 0.0
+
+    #: 缓存有效期（秒）；任何写路径都会立即失效对应缓存
+    _CACHE_TTL = 2.0
 
     # ---- 日志 ----
     def _log(self, msg: str, level: str = "WARN") -> None:
@@ -209,7 +226,33 @@ class CredentialStore:
         logging.getLogger("snipy.credentials").log(lvl, msg)
 
     # ---- 读写 ----
+    def _invalidate_items(self) -> None:
+        """失效凭据列表缓存（任何写 ``credentials.json`` 之后必须调）。"""
+        self._items_cache = None
+        self._items_at = 0.0
+
+    def _invalidate_tokens(self) -> None:
+        """失效 token 缓存（任何写 ``tokens.json`` 之后必须调）。"""
+        self._tokens_cache = None
+        self._tokens_at = 0.0
+
     def _load(self) -> dict:
+        now = time.monotonic()
+        cached = self._items_cache
+        if cached is not None and (now - self._items_at) <= self._CACHE_TTL:
+            # 缓存还新鲜，但仍要探一次文件是否存在：文件被外部**整体删除**
+            # （例如「一键清空」删掉 credentials.json）时必须立刻看到空表，
+            # 不能被缓存挡住；纯粹的内容变化则容忍 TTL 内的滞后。
+            present = True
+            if cached["items"]:
+                try:
+                    present = persist.credentials_path(self._dir).exists()
+                except Exception:
+                    present = True
+            if present:
+                # 返回深一层的副本，调用方随便改都不会污染缓存
+                return {"version": cached["version"], "next_id": cached["next_id"],
+                        "items": [dict(i) for i in cached["items"]]}
         obj = persist.load_credentials(self._dir)
         items: list = []
         if isinstance(obj, dict) and isinstance(obj.get("items"), list):
@@ -219,10 +262,15 @@ class CredentialStore:
         max_id = max([int(i["id"]) for i in items] or [0])
         if not isinstance(next_id, int) or isinstance(next_id, bool) or next_id <= max_id:
             next_id = max_id + 1
-        return {"version": 1, "next_id": next_id, "items": items}
+        self._items_cache = {"version": 1, "next_id": next_id,
+                             "items": [dict(i) for i in items]}
+        self._items_at = now
+        return {"version": 1, "next_id": next_id,
+                "items": [dict(i) for i in items]}
 
     def _save(self, data: dict) -> None:
         persist.save_credentials(data, self._dir)
+        self._invalidate_items()
 
     def _encrypt(self, password: str) -> str:
         stored = dpapi_protect(password)
@@ -234,26 +282,42 @@ class CredentialStore:
 
     # ---- 展示形态（脱敏）----
     @staticmethod
-    def public(item: dict) -> dict:
+    def public(item: dict, token_info: Optional[dict] = None) -> dict:
+        """对外展示形态：**永不**含 ``password_enc`` / token 本体。
+
+        ``token_info`` 为 ``get_token_info()`` 的结果（可选），只用来派生
+        ``has_token`` / ``token_exp`` / ``adopted`` 三个布尔/时间戳字段。
+        """
+        info = token_info if isinstance(token_info, dict) else {}
+        exp = info.get("exp")
+        if isinstance(exp, bool) or not isinstance(exp, (int, float)):
+            exp = None
         return {
             "id": item.get("id"),
             "name": item.get("name") or "",
             "phone": mask_phone(item.get("phone")),
+            "phone_full": normalize_phone(item.get("phone")),
             "has_password": bool(item.get("password_enc")),
             "last_ok_at": item.get("last_ok_at"),
             "last_error": item.get("last_error") or "",
+            "has_token": bool(info.get("token")),
+            "token_exp": int(exp) if exp is not None else None,
+            "last_platform_error": item.get("last_platform_error") or "",
+            "adopted": bool(info.get("adopted")),
         }
 
     # ---- 查询 ----
     def list_public(self) -> list[dict]:
         with self._lock:
             items = self._load()["items"]
-        return [self.public(i) for i in items]
+            tokens = self._load_tokens()
+        return [self.public(i, tokens.get(int(i["id"]))) for i in items]
 
     def list_all(self) -> list[dict]:
         """含 ``password_enc`` 的原始记录（仅内部使用，勿直接回给前端）。"""
         with self._lock:
-            return list(self._load()["items"])
+            # 逐条复制：调用方若改动返回的条目，绝不能改到缓存里的对象
+            return list(dict(i) for i in self._load()["items"])
 
     def get(self, cred_id: Any) -> Optional[dict]:
         try:
@@ -279,6 +343,117 @@ class CredentialStore:
         with self._lock:
             return len(self._load()["items"])
 
+    # ---- 每个账号的 token（tokens.json，**不**写 token.json）----
+    def _load_tokens(self) -> dict:
+        now = time.monotonic()
+        cached = self._tokens_cache
+        if cached is not None and (now - self._tokens_at) <= self._CACHE_TTL:
+            # 同 _load：tokens.json 被整体删除（「一键清空」）后必须立刻返回空，
+            # 否则引擎还会拿缓存里的旧 token 去抢单。
+            present = True
+            if cached:
+                try:
+                    present = persist.tokens_path(self._dir).exists()
+                except Exception:
+                    present = True
+            if present:
+                # 每条也复制：调用方（set_token/clear_token）会就地改动返回的 dict
+                return {cid: dict(info) for cid, info in cached.items()}
+        try:
+            items = persist.load_tokens(self._dir)
+        except Exception:
+            items = {}
+        self._tokens_cache = {cid: dict(info) for cid, info in items.items()}
+        self._tokens_at = now
+        return {cid: dict(info) for cid, info in items.items()}
+
+    def _save_tokens(self, items: dict) -> None:
+        persist.save_tokens(items, self._dir)
+        self._invalidate_tokens()
+
+    def get_token(self, cred_id: Any) -> Optional[str]:
+        """该账号自己的 token（无 → ``None``）。"""
+        info = self.get_token_info(cred_id)
+        return info.get("token") if info else None
+
+    def get_token_info(self, cred_id: Any) -> Optional[dict]:
+        """``{"token":.., "exp":.., "saved_at":.., "adopted": bool?}`` 或 None。"""
+        try:
+            cid = int(cred_id)
+        except Exception:
+            return None
+        with self._lock:                 # 缓存读写统一在同一把锁内
+            info = self._load_tokens().get(cid)
+        return dict(info) if isinstance(info, dict) else None
+
+    def set_token(self, cred_id: Any, token: Any, exp: Optional[int] = None,
+                  adopted: bool = False) -> dict:
+        """把 token 写进 ``tokens.json``（**绝不**改 ``token.json``）。
+
+        ``adopted=True`` 表示这条 token 是由旧全局 Token 推断迁移来的，
+        便于 UI/排查区分（幂等迁移不需要重跑）。
+        """
+        try:
+            cid = int(cred_id)
+        except Exception:
+            raise ValueError("凭据 id 非法")
+        text = token if isinstance(token, str) else str(token or "")
+        text = text.strip()
+        if text.lower().startswith("bearer "):
+            text = text[7:].strip()
+        if not text:
+            raise ValueError("token 不能为空")
+        if exp is not None:
+            if isinstance(exp, bool) or not isinstance(exp, (int, float)):
+                exp = None
+            else:
+                exp = int(exp)
+        with self._lock:
+            items = self._load_tokens()
+            entry = {
+                "token": text,
+                "exp": exp,
+                "saved_at": time.time(),
+            }
+            if adopted:
+                # 只有「启动时的旧 Token 推断迁移」才置位；显式重新取到的
+                # token 会把它清掉（不再算推断）。
+                entry["adopted"] = True
+            items[cid] = entry
+            self._save_tokens(items)
+        return dict(entry)
+
+    def clear_token(self, cred_id: Any) -> bool:
+        """删掉该账号的 token（连带清平台缓存）；返回是否真的删了。"""
+        try:
+            cid = int(cred_id)
+        except Exception:
+            return False
+        removed = False
+        with self._lock:
+            items = self._load_tokens()
+            if cid in items:
+                items.pop(cid, None)
+                self._save_tokens(items)
+                removed = True
+            removed = self._drop_platform_cache(cid) or removed
+        return removed
+
+    def _drop_platform_cache(self, cred_id: int) -> bool:
+        """清 ``platform_accounts.json`` 里该 cred 的缓存（调用方持锁）。"""
+        try:
+            cache = persist.load_platform_cache(self._dir)
+        except Exception:
+            return False
+        if cred_id not in cache:
+            return False
+        cache.pop(cred_id, None)
+        try:
+            persist.save_platform_cache(cache, self._dir)
+        except Exception:
+            return False
+        return True
+
     # ---- 增删 ----
     def add(self, name: Any, phone: Any, password: str) -> dict:
         phone = normalize_phone(phone)
@@ -296,6 +471,7 @@ class CredentialStore:
                 "password_enc": encrypted,
                 "last_ok_at": None,
                 "last_error": "",
+                "last_platform_error": "",
             }
             data["next_id"] = item["id"] + 1
             data["items"].append(item)
@@ -303,6 +479,7 @@ class CredentialStore:
         return self.public(item)
 
     def delete(self, cred_id: Any) -> bool:
+        """删除凭据，并**级联清理**该账号的 token 与平台子账号缓存。"""
         try:
             cid = int(cred_id)
         except Exception:
@@ -314,6 +491,15 @@ class CredentialStore:
                 return False
             data["items"] = kept
             self._save(data)
+            # 级联：tokens.json 条目 + platform_accounts.json 该 cred 缓存
+            tokens = self._load_tokens()
+            if cid in tokens:
+                tokens.pop(cid, None)
+                try:
+                    self._save_tokens(tokens)
+                except Exception:
+                    pass
+            self._drop_platform_cache(cid)
         return True
 
     # ---- 结果回写 ----
@@ -323,6 +509,13 @@ class CredentialStore:
 
     def mark_error(self, cred_id: Any, message: str) -> None:
         self._update(cred_id, {"last_error": str(message or "")[:400]})
+
+    def mark_platform_error(self, cred_id: Any, message: str) -> None:
+        """平台子账号拉取失败（不影响登录结果）；成功时传空串清空。"""
+        self._update(cred_id, {"last_platform_error": str(message or "")[:400]})
+
+    def clear_platform_error(self, cred_id: Any) -> None:
+        self.mark_platform_error(cred_id, "")
 
     def _update(self, cred_id: Any, patch: dict) -> None:
         try:

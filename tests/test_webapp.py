@@ -16,12 +16,17 @@ from __future__ import annotations
 import base64
 import json
 import os
+import sys
 import tempfile
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 import httpx
+
+# 让测试文件无论从项目根、tests/ 还是直接运行都能导入 server 包
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 # ---------------------------------------------------------------- mock 上游
 MOCK = {

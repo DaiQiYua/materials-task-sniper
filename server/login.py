@@ -36,7 +36,7 @@ import urllib.request
 import uuid
 from typing import Any, Callable, Optional
 
-from .core import UA, jwt_exp
+from .core import UA, exp_to_iso, jwt_exp
 from .credentials import (CredentialStore, mask_phone, phone_valid,
                           normalize_phone)
 
@@ -54,6 +54,9 @@ EDGE_CHANNELS = ("msedge", "edge", None)   # Playwright 的 Edge channel 名是 
 POLL_INTERVAL = 1.0
 TOTAL_TIMEOUT = 180.0
 RENEW_COOLDOWN = 60.0
+#: 静默重登失败（非网络类，如密码错误）后的退避秒数：期间再触发直接拒绝，
+#: 不再真打上游登录接口（poller / limits / claim 三个线程都可能触发）。
+RELOGIN_BACKOFF = 60.0
 
 PHASE_IDLE = "idle"
 PHASE_OPENING = "opening"
@@ -449,6 +452,12 @@ class LoginManager:
         self._renew_last = 0.0
         self._renew_key: Optional[tuple] = None
 
+        # 静默重登的并发/退避状态（按 cred 惰性建锁，创建过程用 self._lock 保护）。
+        # 为什么需要：poller / limits / claim worker 三个线程可能同时因 401 触发
+        # 同一 cred 重登；密码错时若不退避，每次触发都会真打一次上游登录接口。
+        self._relogin_locks: dict = {}
+        self._relogin_blocked_until: dict = {}
+
     # ---- 日志（不落任何敏感串）----
     def _log(self, msg: str, level: str = "INFO") -> None:
         try:
@@ -693,8 +702,27 @@ class LoginManager:
         except Exception:
             return ""
 
-    def _login_one(self, record: dict) -> dict:
-        """用一条凭据登录取 token 并写入引擎。返回契约形状的结果 dict。"""
+    def _login_one(self, record: dict, activate: bool = True,
+                   allow_adopt: bool = True) -> dict:
+        """用一条凭据登录取 token 并写入引擎。返回契约形状的结果 dict。
+
+        ``activate``：
+          - ``True``（默认，旧行为）：登录成功后把 token 设为**引擎活跃 token**
+            并写 ``token.json``；
+          - ``False``：只把 token 写进该账号的 ``tokens.json``，**不改**
+            ``engine._token`` / ``token.json``（静默重登、多账号并存用）。
+
+        ``allow_adopt``（只对 ``activate=False`` 有意义）：
+          - ``True``（默认，HTTP 接口 ``fetch-token?activate=false`` 的语义）：
+            引擎**还没有**（或已过期）轮询 Token 时，自动采用该账号的 Token，
+            否则新装用户添加第一个账号后永远不会开始轮询；
+          - ``False``（静默重登用）：**绝不**改活跃 Token —— ``core._relogin_cred``
+            的文档明确承诺「绝不调用 set_token()」，这里必须保持一致，
+            否则一次 401 触发的静默重登会覆写 ``token.json`` 与正在跑的活跃 Token。
+
+        无论 ``activate`` 取何值，只要登录成功就顺手拉一次该账号的平台子账号
+        写缓存；失败只记 ``last_platform_error``，**不影响登录成功结果**。
+        """
         cred_id = record.get("id")
         phone = normalize_phone(record.get("phone"))
         shown = mask_phone(phone)
@@ -720,31 +748,142 @@ class LoginManager:
                 out["_upstream_error"] = True
             return out
 
+        exp = jwt_exp(result)
+        # ① 该账号自己的 token 总是落 tokens.json（与活跃 token 解耦）
         try:
-            info = self._engine.set_token(result)
-        except ValueError as exc:
-            message = scrub(f"上游返回的 token 无效：{exc}", phone, password)
+            self._store.set_token(cred_id, result, exp)
+        except Exception as exc:
+            message = scrub(f"保存该账号 token 失败：{exc}", phone, password)
             self._store.mark_error(cred_id, message)
+            self._log(f"凭据 {shown} {message}", "ERR")
             return {"ok": False, "error": message}
 
+        # ② activate=True 才动引擎活跃 token；若引擎还没有（或已过期）轮询 Token，
+        #    则自动采用该账号的 Token，保证不依赖「设为当前」也能开始轮询。
+        #    allow_adopt=False（静默重登）时一律不 adopt：那是「改活跃 Token」，
+        #    与 _relogin_cred 承诺的「只更新该账号自己的 token」相矛盾。
+        cur = self._engine.token_status()
+        adopt = (not activate) and allow_adopt and (not cur.get("present")
+                                                    or not cur.get("valid"))
+        if activate or adopt:
+            try:
+                info = self._engine.set_token(result)
+            except ValueError as exc:
+                message = scrub(f"上游返回的 token 无效：{exc}", phone, password)
+                self._store.mark_error(cred_id, message)
+                return {"ok": False, "error": message}
+        else:
+            valid = bool(exp and exp > time.time())
+            info = {"valid": valid, "exp": exp_to_iso(exp)}
+
         self._store.mark_ok(cred_id)
-        self._log(f"凭据 {shown} 登录成功，token 已保存（有效期至 {info.get('exp')}）", "OK")
+        if activate:
+            self._log(f"凭据 {shown} 登录成功，token 已保存（有效期至 "
+                      f"{info.get('exp')}）", "OK")
+        elif adopt:
+            self._log(f"凭据 {shown} 登录成功，已自动采用该账号的 Token 作为轮询 Token"
+                      f"（有效期至 {info.get('exp')}）", "OK")
+        else:
+            self._log(f"凭据 {shown} 静默重登成功（仅更新该账号自己的 Token，"
+                      f"不影响活跃 Token）", "OK")
+
+        # ③ 顺手拉一次该账号名下的全部平台子账号（失败不影响登录结果）
+        platform_accounts, platform_error = self._pull_platform_accounts(cred_id)
+        if platform_error:
+            self._log(f"凭据 {shown} 的平台子账号拉取失败：{platform_error}"
+                      f"（登录本身成功）", "WARN")
+
         return {
             "ok": True,
             "valid": bool(info.get("valid")),
             "exp": info.get("exp"),
             "phone": phone,
             "token_saved": True,
+            "platform_accounts": platform_accounts,
+            "platform_error": platform_error,
         }
 
-    def fetch_one(self, cred_id: Any) -> dict:
+    def _pull_platform_accounts(self, cred_id: Any) -> tuple:
+        """拉一次该 cred 的平台子账号并写缓存；返回 ``(items, error|None)``。"""
+        engine = self._engine
+        fn = getattr(engine, "platform_accounts_for_cred", None)
+        if not callable(fn):
+            return ([], None)             # 测试替身/旧引擎：跳过，不影响登录
+        try:
+            result = fn(cred_id, refresh=True)
+        except Exception as exc:
+            return ([], scrub(f"{type(exc).__name__}: {exc}"))
+        if not isinstance(result, dict):
+            return ([], None)
+        items = result.get("items")
+        if not isinstance(items, list):
+            items = []
+        error = result.get("error")
+        return (items, str(error) if error else None)
+
+    def fetch_one(self, cred_id: Any, activate: bool = True,
+                  allow_adopt: bool = True) -> dict:
+        """用单条凭据取 token。``activate=False`` → 不切换引擎活跃 token。
+
+        ``allow_adopt=False`` → 即使引擎没有轮询 Token 也不自动采用（静默重登用）。
+        """
         record = self._store.get(cred_id)
         if record is None:
             return {"ok": False, "error": "凭据不存在"}
-        return self._login_one(record)
+        return self._login_one(record, activate=activate, allow_adopt=allow_adopt)
+
+    def _relogin_lock(self, cred_id: Any) -> threading.Lock:
+        """该 cred 的重登锁（惰性创建；创建过程用 ``self._lock`` 保护）。"""
+        with self._lock:
+            lock = self._relogin_locks.get(cred_id)
+            if lock is None:
+                lock = threading.Lock()
+                self._relogin_locks[cred_id] = lock
+            return lock
+
+    @staticmethod
+    def _relogin_key(cred_id: Any) -> Any:
+        """锁/退避的键统一成 int：``"3"`` 与 ``3`` 必须是同一个 cred。"""
+        try:
+            return int(cred_id)
+        except Exception:
+            return cred_id
+
+    def relogin_cred(self, cred_id: Any) -> dict:
+        """静默重登某个 cred（``activate=False`` 且**不** adopt），供引擎借用其 token。
+
+        为什么不 adopt：``core._relogin_cred`` 的语义是「只更新该账号自己的
+        token、不改活跃 token」，而 ``token.json`` / 活跃 Token 一旦被覆写，
+        正在运行的引擎就会带着别人的 Token 去抢单。
+
+        同名 cred 的重登请求会被锁串行化，并且非网络类失败（如密码错误）
+        进入 ``RELOGIN_BACKOFF`` 冷却：三个线程同时 401 时不会连环打上游登录接口。
+        """
+        key = self._relogin_key(cred_id)
+        lock = self._relogin_lock(key)
+        with lock:
+            if time.monotonic() < float(self._relogin_blocked_until.get(key, 0.0)):
+                return {"ok": False, "error": "relogin_cooling"}
+            result = self.fetch_one(cred_id, activate=False, allow_adopt=False)
+            if result.get("ok"):
+                self._relogin_blocked_until.pop(key, None)
+            else:
+                message = str(result.get("error") or "")
+                # 网络类 / 上游 5xx 属于临时故障，重登仍值得重试；
+                # 其余（密码错误、手机号非法等）是「凭据本身有问题」，
+                # 短时间内重试只会白打上游，故退避。
+                if "网络" not in message and not is_upstream_error(message):
+                    self._relogin_blocked_until[key] = (
+                        time.monotonic() + RELOGIN_BACKOFF)
+            return result
 
     def fetch_any(self, engine: Any = None) -> dict:
-        """依次尝试全部凭据直到首个成功。"""
+        """依次尝试全部凭据直到首个成功（首个成功者即引擎活跃 Token）。
+
+        每个**尝试过并成功**的账号都会被 ``_login_one`` 写进各自的
+        ``tokens.json``；但平台子账号**只对首个成功的账号拉取一次**（``_login_one``
+        成功后即返回，失败账号不产生额外上游请求），避免连环请求打爆限流。
+        """
         if engine is not None:
             self._engine = engine
         records = self._store.list_all()

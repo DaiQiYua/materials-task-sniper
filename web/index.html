@@ -51,18 +51,30 @@
       <button id="btnStop" class="btn btn-danger hidden" type="button">停止</button>
     </div>
 
-    <button id="themeToggle" class="btn-tool theme-toggle" type="button" title="切换浅色 / 深色主题">
-      <svg class="ico-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
-        <circle cx="12" cy="12" r="4"></circle>
-        <line x1="12" y1="2" x2="12" y2="5"></line><line x1="12" y1="19" x2="12" y2="22"></line>
-        <line x1="2" y1="12" x2="5" y2="12"></line><line x1="19" y1="12" x2="22" y2="12"></line>
-        <line x1="4.9" y1="4.9" x2="7" y2="7"></line><line x1="17" y1="17" x2="19.1" y2="19.1"></line>
-        <line x1="4.9" y1="19.1" x2="7" y2="17"></line><line x1="17" y1="7" x2="19.1" y2="4.9"></line>
-      </svg>
-      <svg class="ico-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
-        <path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"></path>
-      </svg>
-    </button>
+    <div class="topbar-tools">
+      <button id="themeToggle" class="btn-tool theme-toggle" type="button" title="切换浅色 / 深色主题">
+        <svg class="ico-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+          <circle cx="12" cy="12" r="4"></circle>
+          <line x1="12" y1="2" x2="12" y2="5"></line><line x1="12" y1="19" x2="12" y2="22"></line>
+          <line x1="2" y1="12" x2="5" y2="12"></line><line x1="19" y1="12" x2="22" y2="12"></line>
+          <line x1="4.9" y1="4.9" x2="7" y2="7"></line><line x1="17" y1="17" x2="19.1" y2="19.1"></line>
+          <line x1="4.9" y1="19.1" x2="7" y2="17"></line><line x1="17" y1="7" x2="19.1" y2="4.9"></line>
+        </svg>
+        <svg class="ico-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+          <path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"></path>
+        </svg>
+      </button>
+
+      <button id="btnWipeData" class="btn-tool wipe-btn" type="button" title="清空所有数据" aria-label="清空所有数据">
+        <svg class="ico-wipe" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M3.5 6.5h17"></path>
+          <path d="M9.5 6.5V4.2h5v2.3"></path>
+          <path d="M5.8 6.5l.9 13.3h10.6l.9-13.3"></path>
+          <line x1="10.2" y1="10.4" x2="10.2" y2="16.2"></line>
+          <line x1="13.8" y1="10.4" x2="13.8" y2="16.2"></line>
+        </svg>
+      </button>
+    </div>
 
     <button id="tokenBadge" class="token-badge bad" type="button" title="点击设置 Token">
       <span class="dot"></span><span class="token-label">Token 未配置</span>
@@ -85,7 +97,7 @@
             <span>登录账号</span>
             <span id="loginCount" class="count">0</span>
           </div>
-          <p class="group-sub">每个账号独立取 Token，可随时切换当前账号；点开账号卡查看其平台子账号（小红书 / 抖音 / 快手）</p>
+          <p class="group-sub">每个账号独立取 Token、独立拉取自己的平台子账号（小红书 / 抖音 / 快手）；所有账号都会参与抢任务，无需切换或指定某个账号</p>
           <div id="loginList" class="acct-list"></div>
           <div id="loginEmpty" class="empty">还没有登录账号。添加后可为每个账号独立取 Token。</div>
         </section>
@@ -95,23 +107,18 @@
     <!-- ── 中栏：任务卡片墙 ── -->
     <main class="pane pane--board">
       <div class="board-head">
-        <div class="search">
-          <svg class="search-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
-            <circle cx="11" cy="11" r="7"></circle><line x1="21" y1="21" x2="16.5" y2="16.5"></line>
-          </svg>
-          <input id="taskSearch" type="text" placeholder="搜索任务标题…" autocomplete="off">
-        </div>
-
-        <div class="chips" id="typeChips">
-          <button data-type="all" class="chip active" type="button">全部</button>
-          <button data-type="standard" class="chip" type="button">standard</button>
-          <button data-type="long_term" class="chip" type="button">long_term</button>
+        <div class="plat-tabs" id="platformTabs" role="group" aria-label="按平台筛选任务">
+          <button class="plat-tab active" type="button" data-platform="all" aria-pressed="true">
+            <span class="plat-tab-name">全部</span>
+          </button>
         </div>
 
         <label class="toggle">
           <input type="checkbox" id="onlyClaimable">
           <span>仅可领取</span>
         </label>
+
+        <button id="filterReset" class="filter-reset hidden" type="button">清除筛选</button>
 
         <div class="topbar-spacer"></div>
         <div class="board-meta" id="boardMeta"></div>
@@ -181,7 +188,7 @@
     <div class="modal-body">
       <section class="tok-sec" id="secCreds" aria-label="账号密码取 Token">
         <h4 class="tok-sec-title"><span class="sec-index">A</span>账号密码取 Token（用户账号）</h4>
-        <p class="tok-sec-desc">这是登录 materials.xlya.cn 的<strong>用户账号</strong>，用于换取 API Token。取 Token 成功后会自动拉取该用户下的 小红书 / 抖音 / 快手 平台子账号（含名称），并展示在左侧对应的账号卡片中。</p>
+        <p class="tok-sec-desc">这是登录 materials.xlya.cn 的<strong>用户账号</strong>，用于换取 API Token。添加账号后会自动取该账号自己的 Token，并拉取它名下的 小红书 / 抖音 / 快手 平台子账号（含名称），展示在左侧对应的账号卡片中；所有账号都可参与抢任务。</p>
         <div id="credList" class="cred-list"></div>
         <div id="credEmpty" class="empty">还没有用户账号，添加手机号 + 密码后可一键取 Token</div>
         <form id="credForm" class="cred-form" autocomplete="off">
@@ -196,6 +203,39 @@
           <button id="btnFetchAny" class="btn btn-sm" type="button">全部尝试</button>
         </div>
       </section>
+    </div>
+  </div>
+</div>
+
+<!-- ════════ 清空所有数据：二次确认弹层 ════════ -->
+<div id="wipeModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="wipeTitle">
+  <div class="modal-card wipe-card">
+    <header class="modal-head">
+      <h3 id="wipeTitle">清空所有数据</h3>
+      <button id="wipeClose" class="btn-tool" type="button" aria-label="关闭">✕</button>
+    </header>
+    <p class="modal-hint wipe-lead">此操作<strong>不可恢复</strong>，并会先停止正在运行的狙击。</p>
+
+    <div class="modal-body">
+      <ul class="wipe-list" aria-label="将被删除的内容">
+        <li>登录账号与密码（全部账号）</li>
+        <li>所有账号的 Token</li>
+        <li>平台子账号缓存（小红书 / 抖音 / 快手）</li>
+        <li>领取历史</li>
+        <li>日志文件（含轮转备份）</li>
+        <li class="wipe-item-reset">配置恢复为出厂默认（base / 轮询间隔 / 限速 / 并发等）</li>
+      </ul>
+
+      <div class="wipe-confirm">
+        <label class="wipe-label" for="wipeConfirmInput">输入「清空」两字以确认</label>
+        <input id="wipeConfirmInput" type="text" autocomplete="off" placeholder="输入「清空」以确认" maxlength="8" aria-describedby="wipeNote">
+        <p class="wipe-note" id="wipeNote">需输入『清空』两字，未输入正确前「永久清空」保持禁用。</p>
+      </div>
+
+      <div class="modal-foot wipe-foot">
+        <button id="wipeCancel" class="btn" type="button">取消</button>
+        <button id="wipeConfirm" class="btn btn-danger" type="button" disabled>永久清空</button>
+      </div>
     </div>
   </div>
 </div>

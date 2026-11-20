@@ -19,6 +19,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import sys
 import tempfile
 import threading
 import time
@@ -26,6 +27,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import httpx
+
+# 让测试文件无论从项目根、tests/ 还是直接运行都能导入 server / task_sniper
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 GOOD_PHONE = "13800001111"
 GOOD_PASSWORD = "pass123"
@@ -305,6 +309,7 @@ def test_credentials_dpapi_unit():
         item = store.add("主号", GOOD_PHONE, BAD_PASSWORD)
         assert item["id"] == 1, item
         assert item["phone"] == "138****1111", item
+        assert item["phone_full"] == GOOD_PHONE, item
         assert item["has_password"] is True
         assert item["last_ok_at"] is None and item["last_error"] == ""
         assert "password_enc" not in json.dumps(item), item
@@ -314,6 +319,7 @@ def test_credentials_dpapi_unit():
 
         assert store.password_for(1) == BAD_PASSWORD
         assert store.list_public()[0]["phone"] == "138****1111"
+        assert store.list_public()[0]["phone_full"] == GOOD_PHONE
 
         # 文件里没有明文密码
         text = (Path(data_dir) / "credentials.json").read_text(encoding="utf-8")
@@ -495,7 +501,11 @@ def test_login_end_to_end():
         assert after[good["id"]]["last_ok_at"], after[good["id"]]
         assert after[bad["id"]]["last_error"], after[bad["id"]]
         assert BAD_PASSWORD not in json.dumps(after, ensure_ascii=False)
-        assert BAD_PHONE not in json.dumps(after, ensure_ascii=False)
+        # phone 打码字段仍保留；同时提供 phone_full 供本地 UI 完整展示
+        assert after[bad["id"]]["phone"] == "139****2222"
+        assert after[bad["id"]]["phone_full"] == BAD_PHONE
+        assert after[good["id"]]["phone"] == "138****1111"
+        assert after[good["id"]]["phone_full"] == GOOD_PHONE
 
         # ---- 5) fetch-any：跳过坏账号，命中好账号 -----------------
         r = client.post("/api/token/fetch-any")

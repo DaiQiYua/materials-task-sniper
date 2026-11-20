@@ -4,6 +4,8 @@
 import sys, time, json, threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
+sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
+
 import task_sniper as m
 
 # ---- 共享状态：先给一个可领取任务，2 秒后改成已抢光，验证只领一次 ----
