@@ -898,5 +898,147 @@ def test_poll_once_prefers_newest_tail_pages(data_dir, monkeypatch):
         engine.stop()
 
 
+def test_scheduler_picks_front_account_and_spreads_tasks(data_dir, monkeypatch):
+    """账号选择策略：单任务用排序靠前的账号；多任务各账号分别领不同任务。"""
+    from server.core import SniperEngine
+
+    engine = SniperEngine(lambda event: None)
+    try:
+        # 三个平台子账号，列表顺序：77（靠前）→ 11 → 99（靠后）
+        engine._pacct_owner = {77: 1, 11: 1, 99: 1}
+        engine._pacct_meta = {77: {"verifyStatus": "verified"},
+                              11: {"verifyStatus": "verified"},
+                              99: {"verifyStatus": "verified"}}
+        engine._pacct_order = {77: 0, 11: 1, 99: 2}
+        engine._pacct_loaded = True
+        monkeypatch.setattr(engine, "_cred_token",
+                            lambda cid: f"tok{cid}", raising=False)
+        engine._claim_threads = [object(), object(), object()]
+        engine._sched.clear()
+
+        now = time.monotonic()
+
+        # 1) 只有一个任务下发 → 排序靠前的账号 77 领取（不是 id 最小的 11）
+        task = {
+            "id": 400, "taskType": "standard", "title": "单任务",
+            "createdAt": "2026-04-01T00:00:00.000Z", "remainingQuota": 1,
+            "claimEligibility": {"canClaim": True, "accounts": [
+                {"id": 11, "canClaim": True}, {"id": 77, "canClaim": True},
+                {"id": 99, "canClaim": True}]},
+        }
+        engine._tasks_map = {400: task}
+        engine._task_first_seen = {400: now}
+        engine._task_last_seen = {400: now}
+        engine._schedule_once()
+        assert engine._task_assigned.get(400) == 77, engine._task_assigned
+
+        # 2) 多个任务同时下发 → 分配给不同账号，各领各的任务
+        engine._sched.clear()
+        engine._task_assigned.clear()
+        engine._account_inflight.clear()
+        engine._task_last_account.clear()
+        engine._task_attempts.clear()
+        tasks = {}
+        first_seen = {}
+        last_seen = {}
+        for idx, tid in enumerate((401, 402)):
+            tasks[tid] = {
+                "id": tid, "taskType": "standard", "title": f"任务{tid}",
+                "createdAt": f"2026-05-0{idx + 1}T00:00:00.000Z",
+                "remainingQuota": 1,
+                "claimEligibility": {"canClaim": True, "accounts": [
+                    {"id": 11, "canClaim": True}, {"id": 77, "canClaim": True},
+                    {"id": 99, "canClaim": True}]},
+            }
+            first_seen[tid] = now
+            last_seen[tid] = now
+        engine._tasks_map = tasks
+        engine._task_first_seen = first_seen
+        engine._task_last_seen = last_seen
+        engine._schedule_once()
+        assigned = dict(engine._task_assigned)
+        assert set(assigned) == {401, 402}, assigned
+        assert assigned[401] != assigned[402], assigned
+        # 靠前的账号先拿新任务，另一个任务落到下一个账号
+        assert assigned[402] == 77, assigned       # 更新 → 排序靠前
+        assert assigned[401] == 11, assigned       # 其次 → 下一个靠前账号
+    finally:
+        engine.stop()
+
+
+def test_scheduler_retry_keeps_same_account(data_dir, monkeypatch):
+    """同一任务重试时沿用上次的账号：换号再撞只会多一个 409。"""
+    from server.core import SniperEngine
+
+    engine = SniperEngine(lambda event: None)
+    try:
+        engine._pacct_owner = {11: 1, 12: 1}
+        engine._pacct_meta = {11: {"verifyStatus": "verified"},
+                              12: {"verifyStatus": "verified"}}
+        engine._pacct_order = {11: 0, 12: 1}
+        engine._pacct_loaded = True
+        monkeypatch.setattr(engine, "_cred_token",
+                            lambda cid: f"tok{cid}", raising=False)
+        engine._claim_threads = [object(), object()]
+        engine._sched.clear()
+
+        now = time.monotonic()
+        task = {
+            "id": 500, "taskType": "standard", "title": "重试任务",
+            "createdAt": "2026-06-01T00:00:00.000Z", "remainingQuota": 1,
+            "claimEligibility": {"canClaim": True, "accounts": [
+                {"id": 11, "canClaim": True}, {"id": 12, "canClaim": True}]},
+        }
+        engine._tasks_map = {500: task}
+        engine._task_first_seen = {500: now}
+        engine._task_last_seen = {500: now}
+        # 上一次是 12 领的（11 当时不可用）
+        engine._task_last_account = {500: 12}
+        engine._task_attempts = {500: 1}
+
+        engine._schedule_once()
+        assert engine._task_assigned.get(500) == 12, engine._task_assigned
+    finally:
+        engine.stop()
+
+
+def test_task_snapshot_annotates_local_cooldown_and_pending(data_dir):
+    """任务快照按 task_id 透出本机冷却 / 待提交（「任务速览」标注状态用）。
+
+    上游不填 nextClaimableAt、remainingQuota 恒为 1，冷却与待提交只能由本机
+    按 (子账号, 任务) 记录推导，所以必须在任务快照里带上。
+    """
+    from server.core import SniperEngine
+
+    engine = SniperEngine(lambda event: None)
+    try:
+        engine._tasks_map = {
+            900: {"id": 900, "taskType": "standard", "title": "已领待提交"},
+            901: {"id": 901, "taskType": "standard", "title": "冷却中"},
+            902: {"id": 902, "taskType": "standard", "title": "无关任务"},
+        }
+        now = time.time()
+        engine._set_task_cooldown(2175, 901, 3600, "standard", 1,
+                                  source="claim_history")
+        engine._set_pending(2175, 900, "standard", 1, source="claim_history")
+        engine._set_task_cooldown(2175, 900, 3600, "standard", 1,
+                                  source="claim_history")
+
+        items = {t["id"]: t for t in engine.tasks()["items"]}
+        # 待提交 + 冷却都透出
+        assert items[900]["localPendingAccounts"] == [2175], items[900]
+        assert items[900]["localCooldownUntil"] > now, items[900]
+        assert items[900]["localCooldownAccounts"] == [2175], items[900]
+        # 只有冷却
+        assert items[901]["localPendingAccounts"] == [], items[901]
+        assert items[901]["localCooldownUntil"] > now, items[901]
+        # 无关任务不带这些字段
+        assert "localPendingAccounts" not in items[902], items[902]
+        # 原始任务对象不被就地改写（池里的 item 保持干净）
+        assert "localPendingAccounts" not in engine._tasks_map[900]
+    finally:
+        engine.stop()
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([os.path.abspath(__file__), "-x", "-q"]))

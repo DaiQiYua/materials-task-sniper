@@ -8,10 +8,10 @@ materials.xlya.cn 任务低时延狙击脚本
 特性
 ----
 - 零依赖：仅用 Python 标准库（urllib / threading / json）。
-- 全局令牌桶限速：遵守接口 6 次/10 秒 的硬限流，避免被限流反而变慢。
+- 全局令牌桶限速：默认 6 次/10 秒（领取侧的保守口径），避免被限流反而变慢。
 - 领取优先：列表轮询与领取共用令牌桶，但领取请求不会被轮询饿死。
 - 遵守冷却/配额：领取前读取 claim-limits，尊重 nextAllowedAtMs / pendingLimit / windowLimit。
-- 自动选号：默认从任务的 claimEligibility.accounts 取第一个可领取账号，也可固定。
+- 自动选号：默认取任务的 claimEligibility.accounts 里的第一个账号（也可用 PLATFORM_ACCOUNT_ID 固定）。
 - 成功提醒：Windows 下抢到会"滴"一声；所有动作带时间戳日志。
 
 使用方法
@@ -29,9 +29,15 @@ materials.xlya.cn 任务低时延狙击脚本
 注意
 ----
 - 同一 JWT 约 7 天过期，过期后重新复制即可。脚本启动会检查过期时间并告警。
-- 限流 6/10s 是硬性天花板：轮询再快也会被桶卡在 ~1.7s 一次。若你确认该限流是「按接口」而非全局，
-  可把 RATE_LIMIT_MAX 调高（如 12）以获得更快探测。
+- 限流说明：``claim-limits`` 里的 ``requestLimit=6 / windowSeconds=10`` 属于**领取侧**
+  限制（描述"还能不能领"），不是任务列表读接口的 QPS 配额。实测（单账号单 token，只读
+  ``GET /api/user/tasks``）列表接口当前**没有硬性限流**，吞吐天花板约 16~17 次/秒，
+  一次性 60 并发也全部 200、零 429；但超过 10 次/秒后延迟开始线性堆高，且上游随时可能
+  打开这套限制。本脚本默认按 6/10s 的保守口径走。
 - 只抢 remainQuota>0 且 canClaim 的任务；canClaim=false（如无对应平台审核号）的任务不会碰。
+- 本脚本是**旧版 CLI**，账号选择逻辑与 Web 版引擎不同（这里固定取
+  ``claimEligibility.accounts[0]``，没有"排序靠前优先 / 多任务各领各的"的调度策略）。
+  功能完整、需要界面与多账号调度时请用 ``python run.py``。
 """
 
 import os

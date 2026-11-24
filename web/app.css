@@ -434,9 +434,11 @@ b, strong { font-weight: 650; }
 .plat-pill-cnt { font-family: var(--mono); font-size: 11px; font-weight: 600; color: var(--text-3); }
 .plat-pill.has .plat-pill-cnt { color: var(--cyan); }
 
-/* 展开区 */
-.acct-detail { border-top: 1px solid var(--line); padding-bottom: 2px;
-  animation: fadeIn 0.32s var(--ease) backwards; }
+/* 展开区：入场动画只在「刚展开」时播一次。
+   之前动画挂在 .acct-detail 上，而账号卡在每次状态刷新时会整块重建
+   （box.textContent='' + 重新 append），于是动画被反复重放 → 账号中心闪烁。 */
+.acct-detail { border-top: 1px solid var(--line); padding-bottom: 2px; }
+.acct-detail.fade-in { animation: fadeIn 0.32s var(--ease) backwards; }
 @keyframes fadeIn { from { opacity: 0; transform: translateY(-5px); } to { opacity: 1; } }
 
 .acct-plat, .acct-claims {
@@ -489,7 +491,7 @@ b, strong { font-weight: 650; }
 .cd-chip.cooling { color: var(--warn); background: var(--warn-bg); border-color: rgba(234,179,8,.3); }
 .cd-chip.pending { color: var(--warn); background: var(--warn-bg); border-color: rgba(234,179,8,.3); }
 .cd-chip.claiming { color: var(--info); background: var(--info-bg); border-color: rgba(56,189,248,.3); }
-.cd-chip.blocked, .cd-chip.none { color: var(--text-3); background: var(--panel-2); border-color: var(--line); }
+.cd-chip.blocked, .cd-chip.none, .cd-chip.no_task { color: var(--text-3); background: var(--panel-2); border-color: var(--line); }
 /* 「只看该号」筛选提示（点击整行等价于点它） */
 .pacct-chev { flex: 0 0 auto; font-size: 10px; color: var(--cyan); white-space: nowrap; cursor: pointer; }
 .pacct-chev:hover { color: var(--text); }

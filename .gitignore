@@ -15,8 +15,8 @@ tokens.json
 platform_accounts.json
 cooldowns.json
 .env
-# deepwork 内部状态
-.slim/deepwork/
+# agent 内部状态与一次性调试脚本（HAR 探针 / 备份副本）
+.slim/
 config.json
 history.jsonl
 *.log

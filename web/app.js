@@ -31,6 +31,8 @@ const state = {
   filters: { platform: null, onlyClaimable: false, platformAccountId: null },
   _platformHints: new Map(),   // code -> 上游给出的中文平台名
   _visibleCount: 0,            // 最近一次渲染后可见任务数（空态文案用）
+  _claimableCount: 0,         // 最近一次渲染后可领取任务数（标题行用）
+  _detailFadeSeen: new Set(),  // 已播过入场动画的登录账号（收起后重置 → 再展开才重播）
 };
 
 const ACCENT_COLORS = ['#4cd97f', '#58a6ff', '#f0b429', '#bc8cff', '#ff8fab', '#2dd4bf'];
@@ -228,12 +230,20 @@ function renderStatus(s) {
   updateTokenBanner(s);
   renderOverview();   // 待提交数 / Token 有效数随状态刷新
   renderBoardEmpty(); // 空态下的轮询次数/频率随状态实时刷新
+  updateBoardMeta();  // 速览的「最后轮询时间」：一眼看出任务池是不是冻结了
 
   // 冷却/待提交快照变化 → 重新绘制账号卡（状态标签与请求冷却倒计时）
   // 注意：只比较稳定字段，不能把每秒变化的 remaining_seconds 算进去。
+  // 请求冷却的 until 每次拉 claim-limits 都会被重新「续」到 now+10s（值在平移，
+  // 语义没变），若把它算进 key，每次轮询都会整块重建账号卡 → 账号中心闪烁。
+  // 倒计时文案由 tickCooldownChips 每秒就地更新，不需要重建；
+  // 这里只比较「有没有在冷却中」这个状态翻转。
   const reqKey = {};
   for (const [cid, rec] of Object.entries(s.request_cooldowns || {})) {
-    reqKey[cid] = [rec.until, rec.reason, rec.pending_count, rec.pending_limit];
+    const remain = rec.remaining_seconds != null
+      ? Number(rec.remaining_seconds) : (Number(rec.until || 0) - Date.now() / 1000);
+    reqKey[cid] = [remain > 0 ? 1 : 0, rec.reason,
+                    rec.pending_count, rec.pending_limit];
   }
   const cdKey = (s.task_cooldowns || []).map(
     (x) => [x.platform_account_id, x.task_id, x.until, x.task_type]);
@@ -420,6 +430,8 @@ function renderLoginAccounts() {
     head.appendChild(chev);
     head.addEventListener('click', () => {
       state.expandedAccountId = isOpen ? null : c.id;
+      // 收起后清掉「已播过入场动画」标记：下次展开才重新播一次
+      if (isOpen) state._detailFadeSeen.delete(c.id);
       renderLoginAccounts();
       // 只有「展开」这一个动作会去拉领取记录；拉不到就静默，区块自己给文案
       if (!isOpen) ensureClaimsLoaded(c.id);
@@ -456,7 +468,10 @@ function renderLoginAccounts() {
 
 /* 展开区只放平台子账号（身份/Token 已在头部一行内展示，避免重复） */
 function renderAccountDetail(c) {
-  const detail = el('div', 'acct-detail');
+  // 入场动画只在「这次展开」播一次：账号卡会被频繁整块重建，动画重放就是闪烁
+  const fresh = !state._detailFadeSeen.has(c.id);
+  if (fresh) state._detailFadeSeen.add(c.id);
+  const detail = el('div', 'acct-detail' + (fresh ? ' fade-in' : ''));
 
   const platWrap = el('div', 'acct-plat');
   const titleRow = el('div', 'acct-plat-title-row');
@@ -638,7 +653,10 @@ function deriveTypeStatus(accountId, taskType, rec) {
     cooling: [],        // [{taskId, untilMs, seconds}]（含历史/本地记录）
     liveCooling: [],    // 仅上游任务 nextClaimableAt 的冷却
     pending: [],        // [taskId]
-    reasons: [],
+    reasons: [],        // 任务级上游 reason（no_verified_account / pending_submission …）
+    typeReasons: [],    // 该类型所有任务的上游 reason（与账号是否在名单里无关）
+    disabled: [],       // 账号级上游 disabledReason（"已有任务待首次提交…" 等）
+    seenTasks: [],      // 上游把该账号列进名单的任务（无论 canClaim 真假）
   };
   const addTask = (id) => {
     if (id != null && !out.claimable.some((x) => x.taskId === id)
@@ -646,24 +664,32 @@ function deriveTypeStatus(accountId, taskType, rec) {
         && !out.pending.includes(id)) out.hasTasks = true;
   };
 
+  const acctPlatform = String((rec && rec.platform) || '');
   for (const t of state._tasksCache || []) {
     if (String(t.taskType) !== tt) continue;
     const ce = t.claimEligibility || {};
     const reason = String(ce.reason || '');
     out.typeHasTasks = true;
+    // 只统计「同平台」任务的上游状态，避免别的平台的 reason 干扰提示
+    if (reason && reason !== 'claimable'
+        && (!acctPlatform || String(t.platform || '') === acctPlatform)
+        && !out.typeReasons.includes(reason)) out.typeReasons.push(reason);
     for (const a of ce.accounts || []) {
       if (!a || Number(a.id) !== aid) continue;
       out.hasTasks = true;
       out.liveHasTasks = true;
       out.accountSeen = true;
       if (a.canClaim === true) out.claimable.push({ taskId: t.id });
+      const dr = String(a.disabledReason || '');
+      if (dr) out.disabled.push(`#${t.id} ${dr}`);
+      if (!out.seenTasks.includes(t.id)) out.seenTasks.push(t.id);
       const until = parseTimeMs(a.nextClaimableAt);
       if (until > Date.now()) {
         out.cooling.push({ taskId: t.id, untilMs: until });
         out.liveCooling.push({ taskId: t.id, untilMs: until });
       }
       if (reason === 'pending_submission') out.pending.push(t.id);
-      if (reason) out.reasons.push(reason);
+      if (reason && reason !== 'claimable' && !out.reasons.includes(reason)) out.reasons.push(reason);
     }
   }
 
@@ -725,16 +751,19 @@ function accountTypeStatus(rec, taskType, credId) {
   else if (info.claimable.length) status = 'ready';
   else if (info.liveCooling.length) status = 'cooling';
   else if (!info.typeHasTasks) status = 'none';
-  else status = 'blocked';
+  else if (info.liveHasTasks) status = 'blocked';   // 上游把这个号列进了名单，但说不能领
+  else status = 'no_task';                               // 上游根本没给这个号派任务
   return { status, info, reqUntil, inflight };
 }
 
+/* 状态标签统一 3 个字（tooltip 里给完整依据） */
 const STATUS_LABEL = {
   claiming: '领取中',
-  ready: '可抢',
+  ready: '可领取',
   pending: '待提交',
-  cooling: '任务冷却',
+  cooling: '冷却中',
   blocked: '不可领',
+  no_task: '无可领',
   none: '无任务',
 };
 
@@ -760,9 +789,18 @@ function statusEvidence(taskType, res) {
     lines.push(`任务冷却：${parts.join('；')}${info.cooling.length > 5 ? ' …' : ''}`);
   }
   if (!lines.length) {
-    lines.push(info.typeHasTasks
-      ? `任务存在但当前不可领${info.reasons.length ? '：' + info.reasons.join('、') : ''}`
-      : `当前没有「${taskTypeLabel(taskType)}」任务`);
+    if (res.status === 'no_task') {
+      lines.push('上游未向该账号下发可领任务：不在任何任务的可领取名单中'
+        + (info.typeReasons.length ? `（上游任务状态：${info.typeReasons.join('、')}）` : ''));
+    } else if (res.status === 'blocked') {
+      lines.push(`上游判定该账号不可领${info.disabled.length
+        ? '：' + info.disabled.slice(0, 5).join('；')
+        : (info.reasons.length ? '：' + info.reasons.join('、') : '')}`);
+    } else {
+      lines.push(info.typeHasTasks
+        ? `任务存在但当前不可领${info.reasons.length ? '：' + info.reasons.join('、') : ''}`
+        : `当前没有「${taskTypeLabel(taskType)}」任务`);
+    }
   }
   return lines;
 }
@@ -852,7 +890,7 @@ function renderPlatformSection(box, credId) {
           const cur = accountTypeStatus(rec, tt, credId);
           const evidence = statusEvidence(tt, cur).join(' | ');
           const kind = cur.status === 'ready' ? 'ok'
-            : cur.status === 'none' || cur.status === 'blocked' ? 'warn' : 'warn';
+            : cur.status === 'none' || cur.status === 'blocked' || cur.status === 'no_task' ? 'warn' : 'warn';
           toast(`${taskTypeLabel(tt)} · ${STATUS_LABEL[cur.status] || cur.status} · ${evidence}`, kind);
         });
         stats.appendChild(chip);
@@ -1139,14 +1177,13 @@ function renderTasks(items) {
   state.lastTasksJson = json;
 
   recomputePlatformAccounts();
-  renderLoginAccounts();
+  // 这里不再整块重绘账号中心：任务变化只影响子账号状态胶囊，而胶囊每秒由
+  // tickCooldownChips 就地更新（重绘整块会打断 hover/滚动，并让入场动画重放）。
   renderTaskBoard();
 }
 
 function taskMatches(t, f) {
-  const elig = t.claimEligibility || {};
-  const can = !!elig.canClaim;
-  if (f.onlyClaimable && !can) return false;
+  if (f.onlyClaimable && !taskCardStatus(t).claimable) return false;
   if (f.platform) {
     if (!taskPlatformCodes(t).includes(f.platform)) return false;
   }
@@ -1198,6 +1235,108 @@ function renderBoardEmpty() {
   stats.appendChild(document.createTextNode(` 次 · ${freq}${last}`));
 }
 
+/* ── 任务卡片状态 ──
+   判定以「账号级资格」为主，任务级 canClaim 只作参考：
+   上游任务级 canClaim 是登录账号维度的聚合结论，同一条任务在不同登录账号
+   视图下 canClaim 并不一致；真正决定「现在能不能领」的是 accounts[].canClaim。
+   另外上游不填 nextClaimableAt、不填 remainingQuota=0，领光与冷却信号要靠
+   claimedCount/totalQuota（上游）与本机 task_cooldowns/pending（后端透出）。 */
+function taskCardStatus(t) {
+  const elig = (t && t.claimEligibility) || {};
+  const accounts = Array.isArray(elig.accounts) ? elig.accounts : [];
+  const reason = String(elig.reason || '');
+  const accClaimable = accounts.filter((a) => a && a.canClaim === true);
+  const total = t.totalQuota != null ? Number(t.totalQuota) : null;
+  const claimed = t.claimedCount != null ? Number(t.claimedCount) : null;
+  const remaining = t.remainingQuota != null ? Number(t.remainingQuota) : null;
+  const exhausted = t.hasClaimed === true
+    || (total != null && claimed != null && claimed >= total)
+    || (remaining != null && remaining <= 0
+        && !(total != null && claimed != null && claimed < total));
+
+  // 本机状态：领了还没提交 / 冷却未到（后端按 task_id 透出）
+  const pendingAcc = Array.isArray(t.localPendingAccounts) ? t.localPendingAccounts : [];
+  const cdUntil = Number(t.localCooldownUntil || 0);
+  const cdAccounts = Array.isArray(t.localCooldownAccounts) ? t.localCooldownAccounts : [];
+
+  const ids = (arr) => arr.map((x) => '#' + x).join('、');
+
+  if (pendingAcc.length) {
+    return {
+      label: '待提交', tone: 'warn', cls: 'taken', claimable: false,
+      tip: `本机已领取、待提交：账号 ${ids(pendingAcc)}`,
+    };
+  }
+  if (cdUntil > Date.now()) {
+    return {
+      label: '冷却中', tone: 'warn', cls: 'taken', claimable: false,
+      tip: `冷却至 ${fmtClockMs(cdUntil)}（剩 ${fmtRemain(cdUntil - Date.now())}）`
+        + (cdAccounts.length ? `· 账号 ${ids(cdAccounts)}` : ''),
+    };
+  }
+  if (exhausted) {
+    return {
+      label: '已领完', tone: 'off', cls: 'exhausted', claimable: false,
+      tip: '配额已领完'
+        + (total != null ? `（${claimed}/${total}）` : '')
+        + (t.hasClaimed === true ? '· 本账号已领取过' : ''),
+    };
+  }
+  if (accClaimable.length) {
+    return {
+      label: '可领取', tone: 'ok', cls: 'claimable', claimable: true,
+      tip: `可领账号：${ids(accClaimable.map((a) => a.id))}`,
+    };
+  }
+  // 不可领：把上游原因翻成人话（账号级 disabledReason 最具体，优先用）
+  let tip = '';
+  const accDisabled = accounts.map((a) => a && a.disabledReason).filter(Boolean)[0];
+  if (accDisabled) {
+    tip = '上游：' + accDisabled;
+  } else if (reason === 'no_verified_account') {
+    tip = '上游：没有通过认证的账号可领（no_verified_account）';
+  } else if (reason === 'pending_submission') {
+    tip = '上游：账号有任务待提交，提交后才可领';
+  } else if (!accounts.length) {
+    tip = '上游：没有可领取的账号';
+  } else if (reason) {
+    tip = '上游：' + reason;
+  } else {
+    tip = '上游未给出原因';
+  }
+  return { label: '不可领', tone: 'off', cls: 'taken', claimable: false, tip };
+}
+
+/* ── 任务速览 · 标题行的「共 N · M 可领 + 最后轮询时间」 ──
+   任务列表只在内容变化时重绘，光看数字不动分不清「上游没新任务」还是
+   「引擎没在跑」。这里把轮询时间一起显示出来，引擎停了会直接写明。 */
+function updateBoardMeta() {
+  const el = $('boardMeta');
+  if (!el) return;
+  const all = state._tasksCache || [];
+  const n = all.length;
+  const claimable = state._claimableCount || 0;
+  if (!n) {
+    el.textContent = '';
+    return;
+  }
+  const s = state.status || {};
+  const running = s.state === 'running';
+  const last = s.last_poll_at ? fmtClock(s.last_poll_at) : '—';
+  const parts = [`共 ${n} · ${claimable} 可领`];
+  if (running) {
+    parts.push(`轮询于 ${last}`);
+  } else if (s.last_poll_at) {
+    parts.push(`引擎未运行 · 最后轮询 ${last}`);
+  } else {
+    parts.push('引擎未运行 · 任务池已冻结');
+  }
+  el.textContent = parts.join(' · ');
+  el.title = running
+    ? '引擎运行中，任务列表按轮询刷新（内容不变时不会重绘）'
+    : '引擎未运行：任务列表不会自动更新，可点「刷新」手动拉一次';
+}
+
 function renderTaskBoard() {
   const f = state.filters;
   const all = state._tasksCache || [];
@@ -1216,12 +1355,9 @@ function renderTaskBoard() {
   let claimable = 0;
 
   for (const t of visible) {
-    const elig = t.claimEligibility || {};
-    const can = !!elig.canClaim;
-    const quota = t.remainingQuota;
-    const exhausted = (quota != null && Number(quota) <= 0);
-    const cls = can && !exhausted ? 'claimable' : (exhausted ? 'exhausted' : 'taken');
-    if (can && !exhausted) claimable += 1;
+    const st = taskCardStatus(t);
+    const cls = st.cls;
+    if (st.claimable) claimable += 1;
 
     const card = el('div', 'trow ' + cls);
 
@@ -1246,37 +1382,19 @@ function renderTaskBoard() {
     info.appendChild(metaLine);
     card.appendChild(info);
 
-    // 右侧：状态（可领取 / 冷却 / 已满）
-    const accounts = Array.isArray(elig.accounts) ? elig.accounts : [];
-    let stateLabel, stateTone;
-    if (can && !exhausted) {
-      stateLabel = '可领取'; stateTone = 'ok';
-    } else if (exhausted) {
-      stateLabel = '已满'; stateTone = 'off';
-    } else {
-      const reason = String(elig.reason || '');
-      if (reason === 'cooling_down') { stateLabel = '冷却'; stateTone = 'warn'; }
-      else if (reason === 'pending_submission') { stateLabel = '待提交'; stateTone = 'warn'; }
-      else { stateLabel = '不可领'; stateTone = 'off'; }
-    }
-    const stEl = el('span', 'trow-state ' + stateTone, stateLabel);
-    if (!can && !exhausted) {
-      const reason = String(elig.reason || '');
-      if (reason === 'cooling_down' && elig.nextClaimableAt) {
-        stEl.title = '冷却至 ' + String(elig.nextClaimableAt).replace('T', ' ').slice(5, 16);
-      } else if (reason) {
-        stEl.title = reason;
-      }
-    }
+    // 右侧：状态（可领取 / 待提交 / 冷却中 / 已领完 / 不可领）
+    const stEl = el('span', 'trow-state ' + st.tone, st.label);
+    if (st.tip) stEl.title = st.tip;
     card.appendChild(stEl);
 
     frag.appendChild(card);
   }
   grid.appendChild(frag);
 
+  state._claimableCount = claimable;
   $('boardEmpty').classList.toggle('hidden', visible.length > 0);
   renderBoardEmpty();
-  $('boardMeta').textContent = all.length ? `共 ${all.length} · ${claimable} 可领` : '';
+  updateBoardMeta();
   // 同步手机端折叠条计数
   const mst = $('mstMeta');
   if (mst) {

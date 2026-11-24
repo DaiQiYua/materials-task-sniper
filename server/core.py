@@ -12,6 +12,17 @@
 7. 失败分类重试：429 / 网络抖动 / 待处理满 → 延迟重排；409 为终态；
    ``seen`` 带 TTL，短暂失败后过一段时间仍可重新发现；
 8. 领取成功按上游 ``retryAfterSeconds`` 设置全局冷却，避免多 worker 把额度打爆。
+
+账号选择（见 ``_schedule_once``）：
+- 同一时间只有一个任务下发 → 用「排序靠前」的账号（平台子账号列表顺序优先）；
+- 多个任务同时下发 → 每个账号分别领取不同任务（同一轮不重复分配账号）；
+- 同一任务全局只分配给一个账号；重试沿用上次的账号（换号再撞只会多一个 409）。
+
+资格判定：**以账号级为准**（``claimEligibility.accounts[].canClaim``），任务级
+``claimEligibility.canClaim`` 只是登录账号维度的聚合结论，不同登录账号视图下并不一致。
+
+上游不填 ``nextClaimableAt``、``remainingQuota`` 常年为 1，冷却/待提交只能由本机按
+(子账号, 任务) 推导；``_task_snapshot()`` 会把它们按 task_id 透出给前端（``local*`` 字段）。
 """
 
 from __future__ import annotations
@@ -267,7 +278,12 @@ class HttpPool:
                 self.drop(key)
                 if attempt:
                     raise
-                key, conn = self._connect(cfg, key)
+                # 重连：_connect 只返回连接对象，key 保持不变。
+                # （早前这里写成 `key, conn = self._connect(...)`，把连接对象
+                #  当元组解包 → "cannot unpack non-iterable HTTPSConnection
+                #  object"，于是「第一次请求偶发失败」直接变成「本轮请求失败」，
+                #  重试从未真正发生，任务列表因此间歇性不更新。）
+                conn = self._connect(cfg, key)
                 self._store()[key] = conn
 
     @staticmethod
@@ -609,10 +625,12 @@ class SniperEngine:
         # 平台子账号 -> 归属登录账号（cred_id）的内存索引
         self._pacct_owner: dict = {}
         self._pacct_meta: dict = {}        # aid -> 平台子账号原始信息（platform/verify/selfDisabled）
+        self._pacct_order: dict = {}       # aid -> 排序名次（越小越靠前：按平台子账号列表顺序）
         self._pacct_loaded = False
 
         # 任务池 / 全局分配锁 / 在途状态
         self._task_assigned: dict = {}     # task_id -> platform_account_id（全局唯一，防同平台互抢）
+        self._task_last_account: dict = {}  # task_id -> 上次分配到的平台账号（重试沿用，避免换号再撞 409）
         self._account_inflight: dict = {}  # platform_account_id -> in-flight 数
         self._task_retry_at: dict = {}     # task_id -> monotonic 重试时刻
         self._task_attempts: dict = {}     # task_id -> 尝试次数
@@ -758,7 +776,8 @@ class SniperEngine:
         self._emit({"type": "status", "status": self.status()})
 
     def _emit_tasks(self, ts: float, items: list) -> None:
-        self._emit({"type": "tasks", "ts": ts, "items": items})
+        # 快照带上本机冷却 / 待提交（前端「任务速览」据此标注状态）
+        self._emit({"type": "tasks", "ts": ts, "items": self._task_snapshot()})
 
     def log(self, msg: str, level: str = "INFO") -> None:
         """对外暴露的日志入口（写环形缓冲 + sniper.log + log 事件）。"""
@@ -870,6 +889,7 @@ class SniperEngine:
                 self._in_flight.clear()
                 self._seen.clear()
                 self._task_assigned.clear()
+                self._task_last_account.clear()
                 self._account_inflight.clear()
                 self._task_retry_at.clear()
                 self._task_attempts.clear()
@@ -952,6 +972,7 @@ class SniperEngine:
         with self._lock:
             self._in_flight.clear()
             self._task_assigned.clear()
+            self._task_last_account.clear()
             self._account_inflight.clear()
         if not was_active:
             return
@@ -994,6 +1015,7 @@ class SniperEngine:
             self._in_flight.clear()
             self._claimed.clear()
             self._task_assigned.clear()
+            self._task_last_account.clear()
             self._account_inflight.clear()
             self._task_retry_at.clear()
             self._task_attempts.clear()
@@ -1005,6 +1027,7 @@ class SniperEngine:
             self._poll_state.clear()
             self._pacct_owner.clear()
             self._pacct_meta.clear()
+            self._pacct_order.clear()
             self._pacct_loaded = False
             # 任务池治理 / 快照节流 / 领取记录同步
             self._gc_at = 0.0
@@ -1195,11 +1218,60 @@ class SniperEngine:
                                  for aid, n in self._account_inflight.items() if n},
         }
 
-    def tasks(self) -> dict:
+    def _local_task_state(self) -> dict:
+        """本机视角的任务状态：``task_id -> 冷却 / 待提交``。
+
+        上游任务列表里没有冷却信息（``nextClaimableAt`` 常年为空），冷却是本机
+        按 ``claimedAt + claimIntervalDays`` 推出来的，所以「任务速览」要显示
+        冷却 / 待提交，必须由后端按 task_id 透出。
+        """
+        now = time.time()
+        out: dict = {}
+        with self._lock:
+            for (aid, tid), rec in list(self._task_cooldowns.items()):
+                until = _as_float(rec.get("until")) or 0.0
+                if until <= now:
+                    continue
+                slot = out.setdefault(tid, {"cooldown_until": 0.0,
+                                            "cooldown_accounts": [],
+                                            "pending_accounts": []})
+                slot["cooldown_until"] = max(slot["cooldown_until"], until)
+                if aid not in slot["cooldown_accounts"]:
+                    slot["cooldown_accounts"].append(aid)
+            for (aid, tid), rec in list(self._pending_submissions.items()):
+                since = _as_float(rec.get("since")) or now
+                if now - since > 3 * 86400:
+                    continue
+                slot = out.setdefault(tid, {"cooldown_until": 0.0,
+                                            "cooldown_accounts": [],
+                                            "pending_accounts": []})
+                if aid not in slot["pending_accounts"]:
+                    slot["pending_accounts"].append(aid)
+        return out
+
+    def _task_snapshot(self) -> list:
+        """任务快照（附带本机冷却 / 待提交信息，供「任务速览」标注状态）。"""
+        local = self._local_task_state()
         with self._lock:
             items = list(self._tasks_map.values())
+        out = []
+        for it in items:
+            tid = it.get("id")
+            rec = local.get(tid)
+            if not rec:
+                out.append(it)
+                continue
+            item = dict(it)
+            item["localCooldownUntil"] = rec["cooldown_until"]
+            item["localCooldownAccounts"] = list(rec["cooldown_accounts"])
+            item["localPendingAccounts"] = list(rec["pending_accounts"])
+            out.append(item)
+        return out
+
+    def tasks(self) -> dict:
+        with self._lock:
             ts = self._tasks_ts
-        return {"ts": ts, "items": items}
+        return {"ts": ts, "items": self._task_snapshot()}
 
     def history(self) -> list:
         with self._lock:
@@ -2380,6 +2452,8 @@ class SniperEngine:
         data = cache if cache is not None else self._load_platform_cache()
         index: dict = {}
         meta: dict = {}
+        order: dict = {}
+        rank = 0
         for cid, rec in (data or {}).items():
             if not isinstance(rec, dict):
                 continue
@@ -2396,9 +2470,14 @@ class SniperEngine:
                     continue
                 index.setdefault(aid, owner)
                 meta.setdefault(aid, dict(item))
+                # 「排序靠前」名次：按平台子账号列表（登录账号 → 子账号）的展示顺序
+                if aid not in order:
+                    order[aid] = rank
+                    rank += 1
         with self._lock:
             self._pacct_owner = index
             self._pacct_meta = meta
+            self._pacct_order = order
             self._pacct_loaded = True
 
     def _ensure_pacct_index(self) -> None:
@@ -2776,11 +2855,11 @@ class SniperEngine:
 
     # ============================ 入库 / 入队 ============================
     def _pick_account(self, item: dict) -> Optional[int]:
-        """在任务的可领取账号中轮流选一个。
+        """在任务的可领取账号中按轮转顺序选一个（**历史遗留，不参与调度**）。
 
-        不再用 ``config.platform_account_id`` 钉死某一个账号：凡是出现在
-        ``claimEligibility.accounts`` 里的平台子账号都可以抢任务，按轮转顺序
-        选取，避免所有任务都压在同一个账号上。
+        实际的账号选择见 ``_schedule_once()``：单任务用「排序靠前」的账号，
+        多任务让每个账号分别领不同任务，重试沿用上次的账号。这里只保留给
+        旧调用方 / 测试用，语义与调度器不同，不要拿它推断线上行为。
         """
         accounts = (item.get("claimEligibility") or {}).get("accounts") or []
         ids: list = []
@@ -2956,6 +3035,18 @@ class SniperEngine:
                 self._loop_error("调度", exc)
                 self._sleep(0.3, stop_ev)
 
+    def _account_rank(self, aid: int) -> int:
+        """平台子账号的「排序靠前」名次（越小越靠前）。
+
+        依据平台子账号列表（登录账号 → 子账号）的展示顺序；列表里没有的账号
+        排到最后，再按账号 id 兜底排序。
+        """
+        with self._lock:
+            rank = self._pacct_order.get(int(aid))
+        if rank is None:
+            return 10 ** 6 + int(aid)
+        return int(rank)
+
     def _account_available(self, aid: int, task_id: Any, task_type: str,
                            now_epoch: float, task_platform: str = "") -> tuple:
         """返回 (是否可用, cred_id)。"""
@@ -3021,7 +3112,19 @@ class SniperEngine:
             return float(self._task_first_seen.get(task_id) or 0.0)
 
     def _schedule_once(self) -> None:
-        """扫描任务池，按最新优先分配给可用平台账号（全局限一个账号/任务）。"""
+        """扫描任务池，按最新优先分配给可用平台账号。
+
+        账号选择策略（用户约定）：
+
+        - **同一时间只有一个任务下发** → 用「排序靠前」的账号领取（平台子账号
+          列表里越靠前的越优先；上游 ``claimEligibility.accounts`` 顺序作为
+          次级依据）。
+        - **多个任务同时下发** → 每个账号分别领取不同任务：同一轮调度里已经
+          分配过的账号不再重复分配，避免多个账号挤同一个任务、也避免一个账号
+          连着抢多单导致另一个账号闲下来（上游配额只有 1，撞车就是 409 浪费）。
+        - 同一任务全局只分配给一个账号（``_task_assigned``），天然不会有两个
+          账号同时抢同一个任务。
+        """
         # 先做任务池治理（内部 5s 节流）：下架任务退役 + 防重抢集合 TTL 清理
         self._gc_state(time.monotonic())
         workers = max(1, len(self._claim_threads))
@@ -3035,11 +3138,11 @@ class SniperEngine:
             tasks = list(self._tasks_map.values())
             now_epoch = time.time()
             mono = time.monotonic()
-            inflight = dict(self._account_inflight)
             assigned = set(self._task_assigned)
             dead = set(self._task_dead)
             claimed = set(self._claimed)
             retry_at = dict(self._task_retry_at)
+            last_account = dict(self._task_last_account)
 
         # 按最新 createdAt / first_seen 排序；同一任务只分配一次
         def sort_key(t: dict) -> tuple:
@@ -3061,6 +3164,8 @@ class SniperEngine:
             ordered = list(self._sorted_cache)
 
         created = 0
+        # 本轮已分配的账号：多任务同时下发时，让它们各领各的任务
+        used_accounts: set = set()
         for item in ordered:
             if created >= workers - active:
                 break
@@ -3078,13 +3183,19 @@ class SniperEngine:
             except Exception:
                 quota = 0.0
             eligibility = item.get("claimEligibility") or {}
-            if quota <= 0 or not bool(eligibility.get("canClaim")):
+            accounts = eligibility.get("accounts") or []
+            # 能否领取以「账号级」为准：上游任务级 canClaim 是登录账号维度的
+            # 聚合结论，不同登录账号视图下可能不一致；真正能领的是某个账号
+            # accounts[].canClaim === true。
+            acc_can = any(isinstance(a, dict) and a.get("canClaim") is True
+                          for a in accounts)
+            if quota <= 0 or not (bool(eligibility.get("canClaim")) or acc_can):
                 continue
             account_type = self._task_types_map.get(tid) or str(item.get("taskType") or "")
-            accounts = eligibility.get("accounts") or []
 
-            best = None
-            for a in accounts:
+            # 候选账号：(排序名次, 上游顺序, aid, cred_id)
+            candidates: list = []
+            for order, a in enumerate(accounts):
                 if not isinstance(a, dict):
                     continue
                 if a.get("canClaim") is False:
@@ -3098,22 +3209,37 @@ class SniperEngine:
                     str(item.get("platform") or ""))
                 if not ok:
                     continue
-                score = (int(inflight.get(aid, 0)), aid)
-                if best is None or score < best[0]:
-                    best = (score, aid, cid)
-            if best is None:
+                candidates.append((self._account_rank(aid), order, aid, cid))
+            if not candidates:
                 continue
-            _score, aid, cid = best
+            # 多任务并发：优先挑本轮还没分配过的账号（各领各的任务）
+            free = [c for c in candidates if c[2] not in used_accounts]
+            pool = free or candidates
+            attempts = int(self._task_attempts.get(tid, 0))
+            # 重试同一个任务时沿用上次的账号：换号再撞一次只会再吃一个 409
+            prev = last_account.get(tid)
+            if attempts > 0 and prev is not None:
+                same = [c for c in pool if c[2] == prev]
+                if same:
+                    best = same[0]
+                else:
+                    best = min(pool, key=lambda c: (c[0], c[1], c[2]))
+            else:
+                # 排序靠前的账号优先
+                best = min(pool, key=lambda c: (c[0], c[1], c[2]))
+            _rank, _order, aid, cid = best
             with self._lock:
                 if tid in self._task_assigned or tid in self._task_dead:
                     continue
                 self._task_assigned[tid] = aid
+                self._task_last_account[tid] = aid
                 self._account_inflight[aid] = int(self._account_inflight.get(aid, 0)) + 1
                 attempts = int(self._task_attempts.get(tid, 0))
             priority = self._task_priority(tid)
             self._sched.push(item, account_type,
                              int(priority), aid, 0.0, attempts)
             created += 1
+            used_accounts.add(aid)
             # 只在「首次调度」（attempts == 0）记一条，且每任务 5s 最多一条：
             # 之前每次调度成功都发一条日志，高并发下把日志区刷成瀑布，
             # 真正的领取结果反而被淹没。
@@ -3121,7 +3247,7 @@ class SniperEngine:
                 with self._lock:
                     self._sched_log_next[tid] = mono + 5.0
                 self._log(f"调度 #{tid} [{item.get('title', '')}] → 平台账号 {aid}"
-                          f"（cred {cid}，最新优先）", "INFO")
+                          f"（cred {cid}，账号排序靠前）", "INFO")
         # 把节流期间挂起的任务快照补发一次（最多 200ms 一次）
         self._flush_tasks_emit()
 

@@ -170,6 +170,49 @@ class _FakeConn:
         self.connected = False
 
 
+def test_pool_request_retries_after_transient_error(monkeypatch):
+    """第一次请求偶发失败时，重连后必须真的重试一次。
+
+    回归：``request()`` 的重连分支曾写成 ``key, conn = self._connect(...)``，
+    把连接对象当元组解包 → ``TypeError: cannot unpack non-iterable
+    HTTPSConnection object``，于是「一次偶发失败」直接变成「本轮请求失败」，
+    任务列表间歇性不更新（日志里全是这句报错）。
+    """
+    calls = {"n": 0}
+
+    class _FlakyConn:
+        def __init__(self, host, port=None, timeout=None, **kwargs):
+            self.host = host
+            self.port = port
+            self.timeout = timeout
+            self.sock = None
+
+        def connect(self):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(http.client, "HTTPSConnection", _FlakyConn)
+    monkeypatch.setattr(http.client, "HTTPConnection", _FlakyConn)
+
+    pool = HttpPool()
+    cfg = EngineConfig(base="https://materials.xlya.cn", proxy=None)
+
+    def fake_do(conn, *a, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:          # 第一次：模拟连接被重置
+            raise OSError("connection reset")
+        return 200, '{"success": true}', 1.0
+
+    monkeypatch.setattr(HttpPool, "_do", staticmethod(fake_do))
+
+    status, body, ms = pool.request(cfg, "GET", "/api/user/tasks", {}, None, 5.0)
+    assert status == 200, (status, body)
+    assert body == '{"success": true}', body
+    assert calls["n"] == 2, calls
+
+
 def test_pool_target_includes_proxy_in_key():
     pool = HttpPool()
     direct = pool._target(EngineConfig(base="https://materials.xlya.cn", proxy=None))
