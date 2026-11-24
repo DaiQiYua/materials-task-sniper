@@ -41,6 +41,10 @@ from .credentials import (CredentialStore, mask_phone, phone_valid,
                           normalize_phone)
 
 LOGIN_PATH = "/api/auth/user/login"
+#: 站点工作台首页（「打开站点」导航目标）
+SITE_LANDING_PATH = "/pages/tasks/index"
+#: 站点把 JWT 放在 localStorage 的这个键（后续请求以 Bearer 发出）
+TOKEN_STORAGE_KEY = "pp_user_token"
 CONNECT_TIMEOUT = 5.0
 READ_TIMEOUT = 10.0
 MAX_ATTEMPTS = 2                  # 首次 + 最多 1 次重试（仅 5xx / 网络错）
@@ -293,6 +297,109 @@ def _launch_browser(pw: Any, headless: bool) -> Any:
     raise last if last is not None else RuntimeError("无法启动浏览器")
 
 
+def _open_site_browser(headless: bool) -> tuple:
+    """启动 playwright 并打开浏览器；返回 ``(playwright, browser)``。
+
+    - 独立函数是为了让测试可以 monkeypatch，避免真的拉起 Edge。
+    """
+    from playwright.sync_api import sync_playwright
+    pw = sync_playwright().start()
+    try:
+        browser = _launch_browser(pw, headless)
+    except Exception:
+        try:
+            pw.stop()
+        except Exception:
+            pass
+        raise
+    return (pw, browser)
+
+
+def build_token_init_script(token: str) -> str:
+    """页面脚本执行前把 token 写进站点 localStorage 的 init script。
+
+    - ``json.dumps`` 保证 token 里的引号 / 反斜杠 / 换行被正确转义（防注入）；
+    - 单行输出，整体 ``try{...}catch(e){}`` 包裹：localStorage 不可用（隐私模式
+      等）时静默失败，绝不打断页面自身的脚本。
+    """
+    literal = json.dumps(str(token or ""), ensure_ascii=False)
+    return ('try{localStorage.setItem("%s", %s);}catch(e){}'
+            % (TOKEN_STORAGE_KEY, literal))
+
+
+# 站点窗口存活探测：往返超时（页面繁忙时最多等这么久，绝不永久阻塞 worker）
+_SITE_PROBE_TIMEOUT_MS = 1000
+#: 真实往返探测用的表达式（只要能求值就说明主线程/连接还活着）
+_SITE_PROBE_JS = "() => true"
+#: 异常文本里命中这些片段 → 判定「目标已关闭」，而不是「页面繁忙」
+_SITE_CLOSED_HINTS = ("has been closed", "target closed", "connection closed",
+                      "browser closed", "context closed", "page closed",
+                      "target crashed")
+
+
+def _is_target_closed_error(exc: BaseException) -> bool:
+    """异常是否表示「页面/上下文/浏览器已关闭」（区别于页面繁忙的超时）。"""
+    if "closed" in type(exc).__name__.lower():      # TargetClosedError 等
+        return True
+    message = str(exc).lower()
+    return any(hint in message for hint in _SITE_CLOSED_HINTS)
+
+
+def _site_alive(page: Any, browser: Any) -> bool:
+    """站点窗口是否还活着：本地标志 + **一次真实往返**。
+
+    为什么必须往返：浏览器进程被外部杀掉（`Stop-Process`、任务管理器结束进程）
+    时，Playwright 的 ``page.is_closed()`` / ``browser.is_connected()`` 只是
+    **本地缓存标志**，仍然返回 ``False`` / ``True``（实测：杀进程后依旧如此），
+    只有真发一次 CDP 往返才会抛 ``TargetClosedError``（消息
+    ``Target page, context or browser has been closed``）。
+
+    往返用 ``wait_for_function``（带 1s 超时）而不是 ``page.evaluate("1")``：
+    evaluate 没有超时参数，页面主线程卡死时该调用没有兜底、可能长时间不返回，
+    worker 线程会一直挂着，``_sites`` 也就摘不掉。而 ``wait_for_function`` 的
+    timeout 由 driver/客户端侧计时（实测：页面主线程死循环时 1.01s 抛
+    ``TimeoutError``），不依赖页面主线程，worker 得以继续存活。
+    注意：这里必须在**创建 page 的那个线程**里探测（playwright sync API 有
+    同线程约束），worker 正是在同一线程里调用。
+
+    异常分流：
+    - ``TargetClosedError`` / 消息含 ``has been closed`` / ``Target crashed``
+      等 → 判定**死亡**；
+    - ``TimeoutError``（往返没在 1s 内回来，但连接还在）、以及任何无法归类
+      的异常 → 判定**存活**，绝不因此关掉用户正开着的窗口。
+    """
+    try:
+        if page is None or page.is_closed():
+            return False
+    except Exception:
+        return False
+    try:
+        if not browser.is_connected():
+            return False
+    except Exception:
+        return False
+    try:
+        handle = page.wait_for_function(_SITE_PROBE_JS,
+                                       timeout=_SITE_PROBE_TIMEOUT_MS)
+    except Exception as exc:
+        return not _is_target_closed_error(exc)
+    try:                                    # 探测句柄用完即弃，别攒 JSHandle
+        if handle is not None:
+            handle.dispose()
+    except Exception:
+        pass
+    return True
+
+
+def _exp_unusable(exp: Any) -> bool:
+    """``exp`` 可解析为整数且已过期（留 60s 余量）→ True；其余一律 False。"""
+    try:
+        value = int(exp)
+    except (TypeError, ValueError):
+        return False
+    return value - 60 <= time.time()
+
+
 def _jwt_payload(token: str) -> dict:
     try:
         payload = token.split(".")[1]
@@ -445,6 +552,8 @@ class LoginManager:
         self._lock = threading.RLock()
         self._session: Optional[dict] = None
         self._pids: set = set()
+        # 「打开站点」的窗口会话：cred_id -> site dict（各自一个 daemon 线程）
+        self._sites: dict = {}
 
         self._renew_stop = threading.Event()
         self._renew_thread: Optional[threading.Thread] = None
@@ -689,11 +798,197 @@ class LoginManager:
         with self._lock:
             if self._session is not None and self._session["active"]:
                 return                      # 会话还在跑，别误杀它自己的浏览器
-            pids = list(self._pids)
-            self._pids.clear()
+            # 「打开站点」窗口的 driver pid 也在 self._pids 里，但它属于**存活**
+            # 的站点会话：取消登录会话（DELETE /api/login-session）时绝不能顺手
+            # 把用户正开着的站点窗口杀掉。存活的留下，交给 shutdown 兜底。
+            busy = set()
+            for site in self._sites.values():
+                thread = site.get("thread")
+                if thread is not None and thread.is_alive():
+                    for pid in site.get("pids") or []:
+                        try:
+                            busy.add(int(pid))
+                        except Exception:
+                            pass
+            pids = [pid for pid in self._pids if pid not in busy]
+            self._pids = {pid for pid in self._pids if pid in busy}
         killed = kill_process_trees(pids)
         if killed:
             self._log(f"已清理残留浏览器进程：{sorted(killed)}", "WARN")
+
+    # ==================== 打开站点（自动登录） ====================
+    def open_site(self, cred_id: int, headless: bool = False) -> dict:
+        """用该账号的 Token 打开站点并自动登录（新开浏览器窗口）。
+
+        Token 通过 ``add_init_script`` 在页面脚本执行**之前**写进
+        ``localStorage[TOKEN_STORAGE_KEY]``，因此站点自己发起的请求天然带
+        ``Authorization: Bearer <token>``，无需在站点上手动登录。
+
+        返回契约：
+          - 已打开（线程存活）→ ``state="already_open"``
+          - 启动成功           → ``state="opened"``
+          - 25s 内未出结果     → ``state="starting"``（窗口随后仍会打开）
+          - 失败               → ``ok=False`` + ``error``（上游 5xx 带
+            ``_upstream_error``，供 API 层转 502）
+        凭据不存在抛 ``ValueError("凭据不存在")``（API 层转 404）。
+        """
+        record = self._store.get(cred_id)
+        if record is None:
+            raise ValueError("凭据不存在")
+        try:
+            cid = int(cred_id)
+        except Exception:
+            cid = cred_id                          # type: ignore[assignment]
+        shown = mask_phone(normalize_phone(record.get("phone"))) or "未知"
+
+        with self._lock:
+            existing = self._sites.get(cid)
+        if existing is not None:
+            thread = existing.get("thread")
+            if thread is not None and thread.is_alive():
+                return {"ok": True, "state": "already_open",
+                        "url": existing.get("url") or "",
+                        "message": "该账号的浏览器窗口已打开"}
+
+        # ① 取可用 token：没有 / 已过期（留 60s 余量）就用密码静默重登取新的
+        refreshed = False
+        info = self._store.get_token_info(cid) or {}
+        token = str(info.get("token") or "")
+        if not token or _exp_unusable(info.get("exp")):
+            res = self._login_one(record, activate=False, allow_adopt=False)
+            if not res.get("ok"):
+                return {"ok": False,
+                        "error": res.get("error") or "重新登录失败",
+                        "_upstream_error": bool(res.get("_upstream_error"))}
+            refreshed = True
+            info = self._store.get_token_info(cid) or {}
+            token = str(info.get("token") or "")
+        if not token:
+            return {"ok": False, "error": "重新登录后仍未拿到可用的 Token"}
+
+        # ② 站点 base 必须已配置
+        base = self._base()
+        if not base:
+            return {"ok": False, "error": "站点 base 未配置"}
+
+        # ③ 起 daemon 线程开窗口（注入 token 后导航到工作台首页）
+        url = base + SITE_LANDING_PATH
+        site = {
+            "cred_id": cid, "token": token, "url": url,
+            "headless": bool(headless), "started_at": time.time(),
+            "stop": threading.Event(), "launched": threading.Event(),
+            "error": "", "message": "", "pw": None, "browser": None,
+            "thread": None, "refreshed": refreshed, "shown": shown,
+        }
+        thread = threading.Thread(target=self._site_worker, args=(site,),
+                                  name=f"sniper-site-{cid}", daemon=True)
+        site["thread"] = thread
+        # 注册与「是否已打开」判定放在同一把锁内：两个请求同时点进来时，
+        # 只有第一个能注册，第二个看到已注册的会话直接返回 already_open，
+        # 不会起出两个浏览器窗口。
+        with self._lock:
+            existing = self._sites.get(cid)
+            if existing is not None:
+                return {"ok": True, "state": "already_open",
+                        "url": existing.get("url") or url,
+                        "message": "该账号的浏览器窗口已打开"}
+            self._sites[cid] = site
+        thread.start()
+
+        # ④ 等启动结果（25s）：有 error 优先报错，其次看是否已 launched
+        site["launched"].wait(timeout=25.0)
+        if site["error"]:
+            return {"ok": False, "error": site["error"]}
+        if site["launched"].is_set():
+            return {"ok": True, "state": "opened", "url": url,
+                    "refreshed": refreshed,
+                    "message": "已在浏览器中打开站点并自动登录（账号 %s）" % shown}
+        return {"ok": True, "state": "starting", "url": url,
+                "message": "浏览器正在启动，请稍候…"}
+
+    def _site_worker(self, site: dict) -> None:
+        """站点窗口 worker：注入 token → 导航 → 保持窗口，直到用户关闭或 stop。"""
+        cid = site.get("cred_id")
+        shown = site.get("shown") or "未知"
+        stop = site["stop"]
+        pw = None
+        browser = None
+        page = None
+        opened = False
+        try:
+            try:
+                pw, browser = _open_site_browser(bool(site["headless"]))
+            except Exception as exc:
+                site["error"] = scrub(
+                    f"无法启动浏览器（Playwright/Edge 不可用）：{exc}", "", "")
+                self._log(f"为账号 {shown} 打开站点失败：{site['error']}", "ERR")
+                return
+            site["pw"] = pw
+            site["browser"] = browser
+            try:
+                pid = _driver_pid(pw)
+            except Exception:
+                pid = None
+            if pid:
+                site.setdefault("pids", []).append(int(pid))
+                with self._lock:
+                    self._pids.add(int(pid))       # shutdown 兜底杀
+
+            # 关键：init script 必须在 goto 之前挂上（每次导航都先执行它，
+            # SPA 内部跳转同样覆盖），这样站点自己的请求就带 Bearer token。
+            context = browser.new_context()
+            context.add_init_script(script=build_token_init_script(site["token"]))
+            page = context.new_page()
+            try:
+                page.goto(site["url"], wait_until="domcontentloaded", timeout=45000)
+            except Exception as exc:
+                message = scrub(f"打开站点失败：{exc}", "", "")
+                if not site["launched"].is_set():
+                    site["error"] = message
+                self._log(f"为账号 {shown} 打开站点失败：{message}", "ERR")
+                return
+            opened = True
+            site["message"] = "已在浏览器中打开站点并自动登录"
+            site["launched"].set()
+            self._log(f"已为账号 {shown} 打开站点（{site['url']}），"
+                      f"token 已注入浏览器", "OK")
+
+            # 保持窗口存活：用户手动关窗 / 收到 stop 才退出
+            while not stop.is_set():
+                if not _site_alive(page, browser):
+                    break
+                stop.wait(1.0)
+        except Exception as exc:
+            message = scrub(f"打开站点异常：{exc}", "", "")
+            if not site["launched"].is_set():
+                site["error"] = message
+            self._log(f"为账号 {shown} 打开站点异常：{message}", "ERR")
+        finally:
+            # 无论成功失败都放行等待方，且把这条会话从 _sites 里摘掉，
+            # 否则用户重试会一直拿到 already_open。
+            site["launched"].set()
+            try:
+                if browser is not None:
+                    browser.close()
+            except Exception:
+                pass
+            try:
+                if pw is not None:
+                    pw.stop()
+            except Exception:
+                pass
+            with self._lock:
+                # 浏览器已关，driver pid 是死的，从兜底集合里摘掉（否则 shutdown
+                # 的 kill_process_trees 会对死 pid 白打一遍并刷出误导性日志）
+                for pid in site.get("pids") or []:
+                    try:
+                        self._pids.discard(int(pid))
+                    except Exception:
+                        pass
+                if self._sites.get(cid) is site:
+                    self._sites.pop(cid, None)
+            if opened:
+                self._log(f"账号 {shown} 的站点窗口已关闭", "INFO")
 
     # ========================= 凭据直登 =========================
     def _base(self) -> str:
@@ -990,8 +1285,38 @@ class LoginManager:
 
     # ========================== 收尾 ===========================
     def shutdown(self) -> None:
-        """停自动续登线程 + 取消会话 + 杀残留 playwright/Edge 子进程。"""
+        """停自动续登线程 + 取消会话 + 关闭站点窗口 + 杀残留 playwright/Edge 子进程。"""
         self.stop_auto_renew()
+        # 关闭所有「打开站点」窗口：先置 stop 让各 worker 自己收尾（关浏览器 +
+        # 停 playwright），再把它们的 driver pid 并入兜底清理。
+        try:
+            with self._lock:
+                sites = list(self._sites.values())
+            for site in sites:
+                try:
+                    site["stop"].set()
+                except Exception:
+                    pass
+            for site in sites:
+                thread = site.get("thread")
+                if thread is not None and thread.is_alive():
+                    try:
+                        thread.join(timeout=2.0)
+                    except Exception:
+                        pass
+            with self._lock:
+                for site in sites:
+                    thread = site.get("thread")
+                    if thread is not None and thread.is_alive():
+                        # 只有 join 超时（窗口还没自己收尾）的才需要按 pid 兜底杀；
+                        # 正常收尾的 worker 已把死 pid 从 self._pids 里摘掉了。
+                        for pid in site.get("pids") or []:
+                            try:
+                                self._pids.add(int(pid))
+                            except Exception:
+                                pass
+        except Exception:
+            pass
         try:
             self.cancel()
         except Exception:

@@ -17,6 +17,15 @@ const state = {
   platformAccounts: new Map(), // id -> {id,name,claimable,total,platform}（任务墙用的合并视图）
   platformByLogin: new Map(),  // cred_id -> {fetched_at, stale, fallback, items:[平台子账号], error}
   platformUnavailable: false,  // by-login 接口不可用（后端未就绪 / 网络异常）时的降级标记
+  claims: {                // 领取记录整包快照（只在展开卡片 / 点「刷新」时拉，轮询不碰）
+    loaded: false,
+    loadedMs: 0,           // 本地拉取完成时刻（ms），用于短暂吃缓存
+    fetchedAt: null,       // 后端给的 fetched_at（秒）
+    byCred: new Map(),     // cred_id -> {fetchedAt, stats, items}
+    errors: {},            // 上游按账号报的错：{"2":"HTTP 500"}
+    error: '',             // 整包请求失败时的人话文案
+  },
+  claimsOpen: new Set(),   // 展开了「全部领取」的 cred_id
   lastCooldownsJson: '',   // 请求/任务冷却/待提交快照变化时才重绘账号卡
   expandedAccountId: null, // 手风琴：当前展开查看平台子账号的登录账号
   filters: { platform: null, onlyClaimable: false, platformAccountId: null },
@@ -41,8 +50,29 @@ const PLATFORMS = [
   { code: 'xiaohongshu', name: '小红书', short: '红', color: '#ff2e4d', text: '#ffffff' },
   { code: 'douyin', name: '抖音', short: '抖', color: '#25f4ee', text: '#04121a' },
   { code: 'kuaishou', name: '快手', short: '快', color: '#ff7a00', text: '#1a0d00' },
+  { code: 'wx_channels', name: '视频号', short: '视', color: '#07c160', text: '#04240f' },
 ];
 const PLATFORM_BY_CODE = new Map(PLATFORMS.map((p) => [p.code, p]));
+
+/* 概览条的列数：CSS 读 --plat-cols，平台表加一项就自动多一格（窄屏另有 2 列折行规则） */
+document.documentElement.style.setProperty('--plat-cols', String(PLATFORMS.length));
+
+/* 平台计数桶：键一律从 PLATFORMS 派生，加平台只改上面那张表 */
+function emptyPlatformCounts() {
+  const counts = {};
+  for (const p of PLATFORMS) counts[p.code] = 0;
+  return counts;
+}
+
+/* 一组平台子账号按 platform 计数（未知平台的账号不计数，与概览副标题口径一致） */
+function countPlatformAccounts(items) {
+  const counts = emptyPlatformCounts();
+  for (const a of (Array.isArray(items) ? items : [])) {
+    const code = String((a && a.platform) || '').toLowerCase();
+    if (counts[code] !== undefined) counts[code] += 1;
+  }
+  return counts;
+}
 
 /* 未知平台兜底色：低饱和中性灰蓝，不与已知平台的品牌色抢注意力 */
 const UNKNOWN_PLATFORM_COLORS = ['#8b98a8', '#8f9bb3', '#94a0ad', '#8994a6', '#9aa3b0', '#8f9aa6'];
@@ -194,9 +224,9 @@ function renderStatus(s) {
   $('btnStart').classList.toggle('hidden', running);
   $('btnStart').textContent = (st === 'paused' || st === 'error') ? '重新启动' : '启动狙击';
 
-  renderTokenBadge(s.token);
   renderTopStats(s);
   updateTokenBanner(s);
+  renderOverview();   // 待提交数 / Token 有效数随状态刷新
   renderBoardEmpty(); // 空态下的轮询次数/频率随状态实时刷新
 
   // 冷却/待提交快照变化 → 重新绘制账号卡（状态标签与请求冷却倒计时）
@@ -222,31 +252,73 @@ function renderTopStats(s) {
   $('tOk').textContent = st.claims_ok != null ? String(st.claims_ok) : '—';
   $('tConflict').textContent = st.claims_conflict != null ? String(st.claims_conflict) : '—';
   $('tFail').textContent = st.claims_fail != null ? String(st.claims_fail) : '—';
-  $('tSkipped').textContent = st.skipped != null ? String(st.skipped) : '—';
+  // 同步时间：优先用后端上次轮询时间，否则显示当前时钟
+  const syncEl = $('syncTime');
+  if (syncEl) syncEl.textContent = (s && s.last_poll_at) ? fmtClock(s.last_poll_at) : fmtClock(Date.now() / 1000);
 }
 
-function daysLeft(exp) {
-  const t = Date.parse(exp);
-  if (!isFinite(t)) return null;
-  return Math.max(0, Math.ceil((t - Date.now()) / 86400000));
-}
-function renderTokenBadge(tok) {
-  const badge = $('tokenBadge');
-  const label = badge.querySelector('.token-label');
-  if (!tok || !tok.present) {
-    badge.className = 'token-badge bad';
-    label.textContent = 'Token 未配置';
-    return;
+/* ── 账号概览指标（登录账号 / 平台子账号 / Token / 待提交） ── */
+function renderOverview() {
+  const accounts = state.accounts || [];
+  // 平台子账号：合并所有登录账号桶，按 id 去重
+  const allSubs = new Map();
+  const platCounts = emptyPlatformCounts();
+  for (const bucket of state.platformByLogin.values()) {
+    const items = (bucket && Array.isArray(bucket.items)) ? bucket.items : [];
+    for (const a of items) {
+      if (!a || a.id == null) continue;
+      const id = Number(a.id);
+      if (!isFinite(id) || allSubs.has(id)) continue;
+      allSubs.set(id, a);
+      const code = String(a.platform || '').toLowerCase();
+      if (platCounts[code] !== undefined) platCounts[code] += 1;
+    }
   }
-  if (tok.valid) {
-    const d = daysLeft(tok.exp);
-    badge.className = 'token-badge good';
-    label.textContent = d == null ? 'Token 有效' : `Token 有效 · 余 ${d} 天`;
+
+  // 登录账号数 + 异常数
+  const abnormal = accounts.filter((c) => c && (c.last_error || tokenStatusFor(c).cls !== 'ok')).length;
+  $('ovLogin').textContent = String(accounts.length);
+  const loginHint = $('ovLoginHint');
+  if (abnormal > 0) {
+    loginHint.textContent = abnormal + ' 个异常';
+    loginHint.classList.remove('hidden');
   } else {
-    badge.className = 'token-badge bad';
-    label.textContent = 'Token 已过期';
+    loginHint.classList.add('hidden');
+  }
+
+  // 平台子账号数 + 分平台分布
+  $('ovSub').textContent = String(allSubs.size);
+  $('ovSubHint').textContent = state.platformUnavailable
+    ? '暂时无法获取'
+    : PLATFORMS.map((p) => `${p.name} ${platCounts[p.code] || 0}`).join(' · ');
+
+  // Token 有效数
+  const valid = accounts.filter((c) => c && tokenStatusFor(c).cls === 'ok').length;
+  $('ovToken').textContent = `${valid}/${accounts.length}`;
+
+  // 待提交数：取所有账号 pending_submissions 去重（按 platform_account_id + task_id）
+  const pendSet = new Set();
+  const pendList = (state.status && state.status.pending_submissions) || [];
+  for (const p of pendList) {
+    pendSet.add(String(p.platform_account_id) + '|' + String(p.task_id));
+  }
+  $('ovPending').textContent = String(pendSet.size);
+
+  // 账号区副标题
+  const sub = $('accountSubtitle');
+  if (sub) sub.textContent = `${accounts.length} 个登录账号 · ${allSubs.size} 个平台子账号`;
+
+  // 手机端次级折叠条计数：任务 / 日志 / 领取记录
+  const mst = $('mstMeta');
+  if (mst) {
+    const tasks = (state._tasksCache || []).length;
+    const logs = $('logList') ? $('logList').children.length : 0;
+    const hist = state.lastHistoryItems != null ? state.lastHistoryItems : 0;
+    mst.textContent = `${tasks} / ${logs} / ${hist}`;
   }
 }
+
+
 
 function refreshStatus() {
   api('/api/status').then(renderStatus).catch(() => {});
@@ -279,7 +351,6 @@ function renderLoginAccounts() {
     // ── 头部（点击展开/收起）──
     const head = el('div', 'acct-head');
     const ava = el('div', 'acct-ava ' + (c.last_error ? 'bad' : (c.last_ok_at ? 'ok' : '')));
-    ava.style.background = colorFor(c.phone || c.id);
     ava.appendChild(el('span', null, initials(c.name || c.phone || c.id)));
     const ring = el('span', 'ring');
     ava.appendChild(ring);
@@ -311,10 +382,14 @@ function renderLoginAccounts() {
       metaEl.appendChild(document.createTextNode(' · '));
     }
     metaEl.appendChild(document.createTextNode(metaText));
+    // 窄栏里 meta 会被单行省略号截断（新增「打开原站」按钮后更窄）：补 title，悬停可看全文
+    metaEl.title = metaText;
     info.appendChild(metaEl);
     head.appendChild(info);
 
-    // ── 头部右侧操作按钮（不占独立行）──
+    // ── 头部右侧操作区（不占独立行；多个按钮收进一个容器，间距比头部主间距更紧）──
+    const actions = el('div', 'acct-actions');
+
     const btnFetch = el('button', 'mini-btn primary', '取 Token');
     btnFetch.type = 'button';
     btnFetch.title = '重新获取该账号的 Token 与平台子账号';
@@ -322,18 +397,32 @@ function renderLoginAccounts() {
       e.stopPropagation();
       fetchTokenById(c.id, btnFetch);
     });
-    head.appendChild(btnFetch);
+    actions.appendChild(btnFetch);
+
+    // 打开原网站：纯文字按钮「原站」（设计稿要求去掉矢量图标，只保留文字）
+    const btnOpen = el('button', 'mini-btn open-site', '原站');
+    btnOpen.type = 'button';
+    btnOpen.title = '打开原网站并自动登录（会新开一个浏览器窗口，需等几秒）';
+    btnOpen.setAttribute('aria-label', '打开原网站并自动登录');
+    btnOpen.addEventListener('click', (e) => {
+      e.stopPropagation();
+      openSiteForCred(c, btnOpen);
+    });
+    actions.appendChild(btnOpen);
 
     const btnDel = el('button', 'mini-btn danger', '删除');
     btnDel.type = 'button';
     btnDel.addEventListener('click', (e) => { e.stopPropagation(); deleteCred(c.id); });
-    head.appendChild(btnDel);
+    actions.appendChild(btnDel);
+    head.appendChild(actions);
 
     const chev = el('span', 'acct-chev', '▾');
     head.appendChild(chev);
     head.addEventListener('click', () => {
       state.expandedAccountId = isOpen ? null : c.id;
       renderLoginAccounts();
+      // 只有「展开」这一个动作会去拉领取记录；拉不到就静默，区块自己给文案
+      if (!isOpen) ensureClaimsLoaded(c.id);
     });
     card.appendChild(head);
 
@@ -341,9 +430,7 @@ function renderLoginAccounts() {
     const strip = el('div', 'acct-strip');
     for (const p of PLATFORMS) {
       const pill = el('div', 'plat-pill');
-      pill.style.borderColor = p.color;
       const ico = el('span', 'plat-pill-ico', p.short);
-      ico.style.background = p.color; ico.style.color = p.text;
       pill.appendChild(ico);
       pill.appendChild(el('span', 'plat-pill-name', p.name));
       const n = counts[p.code] || 0;
@@ -364,7 +451,7 @@ function renderLoginAccounts() {
   box.appendChild(frag);
 
   $('loginEmpty').classList.toggle('hidden', list.length > 0);
-  $('loginCount').textContent = String(list.length);
+  renderOverview();
 }
 
 /* 展开区只放平台子账号（身份/Token 已在头部一行内展示，避免重复） */
@@ -394,6 +481,8 @@ function renderAccountDetail(c) {
   const platBox = el('div', 'acct-plat-list');
   platWrap.appendChild(platBox);
   detail.appendChild(platWrap);
+  // 进行中任务 / 阶段：紧跟在平台子账号之后，是该账号下唯一的一处进行中任务列表
+  detail.appendChild(renderClaimsBlock(c));
   renderPlatformSection(platBox, c.id);
   return detail;
 }
@@ -725,9 +814,7 @@ function renderPlatformSection(box, credId) {
 
     const ava = el('div', 'pacct-ava');
     const p = PLATFORMS.find((x) => x.code === rec.platform)
-      || { short: (rec.platformName || '?')[0] || '?', color: 'var(--border-strong)', text: 'var(--text)' };
-    ava.style.background = p.color;
-    ava.style.color = p.text;
+      || { short: (rec.platformName || '?')[0] || '?' };
     ava.textContent = p.short;
     card.appendChild(ava);
 
@@ -736,11 +823,8 @@ function renderPlatformSection(box, credId) {
     const tagRow = el('div', 'pacct-tags');
     if (rec.platform) {
       const plat = PLATFORMS.find((x) => x.code === rec.platform)
-        || { short: rec.platformName || rec.platform, name: rec.platformName || rec.platform,
-             color: 'var(--border-strong)', text: 'var(--text)' };
+        || { short: rec.platformName || rec.platform, name: rec.platformName || rec.platform };
       const tag = el('span', 'plat-tag', plat.name || plat.short);
-      tag.style.background = plat.color;
-      tag.style.color = plat.text;
       tagRow.appendChild(tag);
     }
     if (rec.verifyStatus) {
@@ -781,10 +865,18 @@ function renderPlatformSection(box, credId) {
     info.appendChild(stats);
     card.appendChild(info);
 
+    const picked = selected === rec.id;
+    const chev = el('span', 'pacct-chev', picked ? '已筛选 ✓' : '只看该号 ▾');
+    chev.title = picked
+      ? '只看该子账号的进行中任务（不影响任务速览），再点一次取消'
+      : '点击后只看该子账号的进行中任务；任务速览始终显示平台下发的全部任务';
+    card.appendChild(chev);
+
+    // 点击行：只收窄本卡片「进行中任务」的子账号作用域，任务速览不受影响
     card.addEventListener('click', () => {
-      state.filters.platformAccountId = (selected === rec.id) ? null : rec.id;
+      state.filters.platformAccountId = picked ? null : rec.id;
+      if (!picked) ensureClaimsLoaded(credId);
       renderLoginAccounts();
-      renderTaskBoard();
     });
     frag.appendChild(card);
   }
@@ -825,16 +917,21 @@ function platformLastErrorFor(credId) {
   return '';
 }
 
+/* 某登录账号的平台子账号（id + 名称），顺序与卡片里的子账号行一致 */
+function platformSubAccounts(credId) {
+  const bucket = state.platformByLogin.get(Number(credId));
+  const raw = (bucket && Array.isArray(bucket.items)) ? bucket.items : [];
+  return raw.map((a) => {
+    const id = a && a.id != null ? Number(a.id) : NaN;
+    const merged = state.platformAccounts.get(id) || {};
+    return { id, name: String((a && a.name) || merged.name || '') };
+  }).filter((s) => isFinite(s.id));
+}
+
 /* 单个账号的平台子账号数量（卡片概览条用） */
 function platformCountsFor(credId) {
-  const counts = { xiaohongshu: 0, douyin: 0, kuaishou: 0 };
   const bucket = state.platformByLogin.get(Number(credId));
-  const items = (bucket && Array.isArray(bucket.items)) ? bucket.items : [];
-  for (const a of items) {
-    const code = String((a && a.platform) || '').toLowerCase();
-    if (code in counts) counts[code] += 1;
-  }
-  return counts;
+  return countPlatformAccounts((bucket && Array.isArray(bucket.items)) ? bucket.items : []);
 }
 
 /* by-login 单桶归一化 */
@@ -966,10 +1063,8 @@ function makePlatformTab(code) {
   btn.dataset.platform = code;
   const meta = code === 'all' ? null : platformMetaOf(code);
   if (meta) {
-    btn.style.setProperty('--pt-soft', withAlpha(meta.color, 0.18));
-    btn.style.setProperty('--pt-line', withAlpha(meta.color, 0.55));
     const dot = el('span', 'plat-dot');
-    dot.style.background = meta.color;
+    dot.style.background = 'var(--cyan)';
     btn.appendChild(dot);
   }
   btn.appendChild(el('span', 'plat-tab-name', meta ? meta.name : '全部'));
@@ -1016,13 +1111,13 @@ function renderPlatformTabs() {
   return reset;
 }
 
-/* 「清除筛选」胶囊：平台筛选与左侧账号筛选叠加，命中任一项就显示 */
+/* 「清除筛选」胶囊：只反映任务速览的平台筛选。
+   子账号作用域只影响账号卡片里的「进行中任务」，与任务速览无关，故不在此回显。 */
 function renderFilterReset() {
   const btn = $('filterReset');
   if (!btn) return;
   const parts = [];
   if (state.filters.platform) parts.push(platformMetaOf(state.filters.platform).name);
-  if (state.filters.platformAccountId != null) parts.push(`账号 #${state.filters.platformAccountId}`);
   if (!parts.length) {
     btn.classList.add('hidden');
     btn.textContent = '清除筛选';
@@ -1031,7 +1126,7 @@ function renderFilterReset() {
   }
   btn.classList.remove('hidden');
   btn.textContent = '清除：' + parts.join(' + ');
-  btn.title = '平台与账号筛选叠加生效；点击同时清除两者';
+  btn.title = '点击清除平台筛选（任务速览只受平台筛选影响）';
 }
 
 /* ── 任务卡片墙 ── */
@@ -1055,11 +1150,10 @@ function taskMatches(t, f) {
   if (f.platform) {
     if (!taskPlatformCodes(t).includes(f.platform)) return false;
   }
-  if (f.platformAccountId != null) {
-    const accounts = Array.isArray(elig.accounts) ? elig.accounts : [];
-    const hit = accounts.some((a) => (a.id != null ? Number(a.id) : (typeof a === 'number' ? a : NaN)) === f.platformAccountId);
-    if (!hit) return false;
-  }
+  // 任务速览 = 「平台下发的任务池」：只按平台 / 可领取性筛选。
+  // 绝不按「当前查看的子账号」收窄——那等于拿 claimEligibility.accounts 当可见性开关，
+  // 会把平台已下发、但当前账号暂无资格领的任务（如未认证视频号，上游返回 accounts: []）
+  // 整体隐藏，看起来像"平台没下发任务"。资格问题应由状态标注（可领取/不可领）表达。
   return true;
 }
 
@@ -1084,12 +1178,12 @@ function renderBoardEmpty() {
   const stats = $('boardEmptyStats');
   if (filteredOut) {
     text.textContent = '当前筛选下没有任务';
-    stats.textContent = `共 ${all} 个任务被平台 / 账号筛选隐藏 · 点「清除筛选」可看全部`;
+    stats.textContent = `共 ${all} 个任务被平台筛选隐藏 · 点「清除筛选」可看全部`;
     return;
   }
   if (!running) {
     text.textContent = '暂无任务';
-    stats.textContent = '启动狙击后开始轮询上游';
+    stats.textContent = '引擎未启动 · 点「刷新」可手动拉取，启动狙击后自动轮询';
     return;
   }
   text.textContent = '等待上游轮询…';
@@ -1129,94 +1223,52 @@ function renderTaskBoard() {
     const cls = can && !exhausted ? 'claimable' : (exhausted ? 'exhausted' : 'taken');
     if (can && !exhausted) claimable += 1;
 
-    const card = el('div', 'task-card ' + cls);
+    const card = el('div', 'trow ' + cls);
 
-    // 四角瞄准框（仅可领取）
-    if (cls === 'claimable') {
-      ['c-tl', 'c-tr', 'c-bl', 'c-br'].forEach((c) => card.appendChild(el('span', 'corner ' + c)));
-    }
-
-    // 顶部：标题 + 类型
-    const top = el('div', 'task-top');
-    const titleWrap = el('div');
-    titleWrap.appendChild(el('div', 'task-title', t.title != null ? String(t.title) : '—'));
-    // 元信息行：平台徽标（可能多个）+ 任务 id
-    const metaLine = el('div', 'task-meta');
+    // 左侧：标题 + 元信息（平台 · 编号）
+    const info = el('div', 'trow-info');
+    info.appendChild(el('div', 'trow-title', t.title != null ? String(t.title) : '—'));
+    const metaLine = el('div', 'trow-meta');
     const codes = taskPlatformCodes(t);
     if (codes.length) {
       const metas = codes.map((c) => platformMetaOf(c));
       const plats = metas.map((m) => m.name);
-      const first = metas[0];
-      const badge = el('span', 'task-plat');
+      const badge = el('span', 'trow-plat');
       badge.title = (codes.length > 1 ? plats.join(' · ') : plats[0]) + `（${codes.join(' / ')}）`;
-      const dot = el('span', 'task-plat-dot');
-      dot.style.background = first.color;
+      const dot = el('span', 'trow-plat-dot');
+      dot.style.background = 'var(--cyan)';
       badge.appendChild(dot);
-      badge.appendChild(el('span', 'task-plat-name', first.name));
-      if (metas.length > 1) badge.appendChild(el('span', 'task-plat-more', '+' + (metas.length - 1)));
+      badge.appendChild(el('span', null, metas[0].name));
+      if (metas.length > 1) badge.appendChild(el('span', 'trow-plat-more', '+' + (metas.length - 1)));
       metaLine.appendChild(badge);
     }
-    metaLine.appendChild(el('div', 'task-id', `#${t.id != null ? t.id : '—'}`));
-    titleWrap.appendChild(metaLine);
-    top.appendChild(titleWrap);
-    top.appendChild(el('span', 'task-type', t.taskType != null ? String(t.taskType) : '—'));
-    card.appendChild(top);
+    metaLine.appendChild(el('span', 'trow-id', `#${t.id != null ? t.id : '—'}`));
+    info.appendChild(metaLine);
+    card.appendChild(info);
 
-    // 指标：佣金 + 剩余配额
-    const metrics = el('div', 'task-metrics');
-    const m1 = el('div', 'metric');
-    m1.appendChild(el('span', 'metric-v accent', t.baseCommission != null ? String(t.baseCommission) : '—'));
-    m1.appendChild(el('span', 'metric-k', '佣金'));
-    metrics.appendChild(m1);
-    const m2 = el('div', 'metric');
-    const qv = el('span', 'metric-v' + (exhausted ? ' faint' : ''), quota == null ? '—' : String(quota));
-    m2.appendChild(qv);
-    m2.appendChild(el('span', 'metric-k', '剩余配额'));
-    metrics.appendChild(m2);
-    card.appendChild(metrics);
-
-    // 可领取账号头像行
+    // 右侧：状态（可领取 / 冷却 / 已满）
     const accounts = Array.isArray(elig.accounts) ? elig.accounts : [];
-    if (accounts.length) {
-      const eligWrap = el('div', 'elig');
-      const max = 6;
-      accounts.slice(0, max).forEach((a) => {
-        const id = a.id != null ? a.id : a;
-        const av = el('span', 'elig-ava', initials(a.nickname || a.name || id));
-        av.style.background = colorFor(id);
-        av.title = `#${id}` + (a.nickname || a.name ? ` · ${a.nickname || a.name}` : '');
-        if (f.platformAccountId != null && Number(id) === f.platformAccountId) {
-          av.style.outline = '2px solid var(--accent)';
-          av.style.outlineOffset = '1px';
-        }
-        eligWrap.appendChild(av);
-      });
-      if (accounts.length > max) eligWrap.appendChild(el('span', 'elig-ava more', '+' + (accounts.length - max)));
-      eligWrap.appendChild(el('span', 'elig-label', `${accounts.length} 个账号可领`));
-      card.appendChild(eligWrap);
+    let stateLabel, stateTone;
+    if (can && !exhausted) {
+      stateLabel = '可领取'; stateTone = 'ok';
+    } else if (exhausted) {
+      stateLabel = '已满'; stateTone = 'off';
+    } else {
+      const reason = String(elig.reason || '');
+      if (reason === 'cooling_down') { stateLabel = '冷却'; stateTone = 'warn'; }
+      else if (reason === 'pending_submission') { stateLabel = '待提交'; stateTone = 'warn'; }
+      else { stateLabel = '不可领'; stateTone = 'off'; }
     }
-
-    // 底部：领取状态
-    const foot = el('div', 'task-foot');
-    const badgeEl = el('span', 'claim-badge ' + (can ? 'ok' : 'off'), can ? '可领取' : '不可领');
-    let note = exhausted ? '配额已空' : '';
+    const stEl = el('span', 'trow-state ' + stateTone, stateLabel);
     if (!can && !exhausted) {
-      // 上游 claimEligibility 自带 reason/nextClaimableAt，展示出来便于诊断
       const reason = String(elig.reason || '');
       if (reason === 'cooling_down' && elig.nextClaimableAt) {
-        note = '冷却至 ' + String(elig.nextClaimableAt).replace('T', ' ').slice(5, 16);
-      } else if (reason === 'no_verified_account') {
-        note = '无已验证账号';
+        stEl.title = '冷却至 ' + String(elig.nextClaimableAt).replace('T', ' ').slice(5, 16);
       } else if (reason) {
-        note = reason;
+        stEl.title = reason;
       }
-      const accHit = accounts.find((a) => a && a.disabledReason);
-      if (accHit) note = String(accHit.disabledReason);
-      if (note) badgeEl.title = note;
     }
-    foot.appendChild(badgeEl);
-    foot.appendChild(el('span', 'elig-label', note));
-    card.appendChild(foot);
+    card.appendChild(stEl);
 
     frag.appendChild(card);
   }
@@ -1224,9 +1276,68 @@ function renderTaskBoard() {
 
   $('boardEmpty').classList.toggle('hidden', visible.length > 0);
   renderBoardEmpty();
-  $('boardMeta').textContent = all.length
-    ? `共 ${all.length} 个 · 显示 ${visible.length} · ${claimable} 个可领`
-    : '';
+  $('boardMeta').textContent = all.length ? `共 ${all.length} · ${claimable} 可领` : '';
+  // 同步手机端折叠条计数
+  const mst = $('mstMeta');
+  if (mst) {
+    const logs = $('logList') ? $('logList').children.length : 0;
+    const hist = state.lastHistoryItems != null ? state.lastHistoryItems : 0;
+    mst.textContent = `${all.length} / ${logs} / ${hist}`;
+  }
+}
+
+/* 后端 errors 里可能给字符串，也可能给带 message/detail 的对象：统一取一句人话 */
+function firstTaskError(errors) {
+  const list = Array.isArray(errors) ? errors.filter(Boolean) : [];
+  const first = list[0];
+  if (typeof first === 'string') return first.trim();
+  if (first && typeof first === 'object') {
+    const m = first.message || first.detail || first.error;
+    if (typeof m === 'string' && m.trim()) return m.trim();
+  }
+  return '';
+}
+
+/* ── 任务速览 · 手动刷新 ──
+   后端在引擎停止时也能向上游拉一次，所以这里不看 state.status：
+   点一下就真去拉，回来把整只列表灌进 renderTasks，再报条数。 */
+async function refreshTasksManual(btn) {
+  if (!btn || btn.disabled) return;          // 连点保护
+  const label = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '刷新中…';
+  try {
+    const r = await api('/api/tasks/refresh', { method: 'POST' });
+    const hasTasks = !!(r && r.tasks && Array.isArray(r.tasks.items));
+    const items = hasTasks ? r.tasks.items : [];
+    const ok = !!(r && r.ok);
+
+    // 拉到任务（或明确成功）才回灌列表：失败且没带任务时不要把手上的列表清空
+    if (ok || hasTasks) {
+      const before = state.lastTasksJson;
+      renderTasks(items);
+      // renderTasks 内容未变时会跳过重绘（幂等），这里补一次，
+      // 保证「共 N · M 可领」与空态文案紧跟手动刷新
+      if (state.lastTasksJson === before) renderTaskBoard();
+    }
+
+    if (ok) {
+      const n = (r.count != null && isFinite(Number(r.count))) ? Number(r.count) : items.length;
+      toast(n > 0 ? `已手动拉取 ${n} 个任务` : '已拉取，上游暂无任务', 'ok');
+    } else {
+      const detail = firstTaskError(r && r.errors);
+      if (detail) toast('拉取失败：' + detail, 'err');
+      else toast('拉取失败：上游没有返回任务数据', 'warn');
+    }
+  } catch (err) {
+    // api() 抛出的 message 已是中文人话；断网时 fetch 只给英文，兜一句中文
+    const msg = String((err && err.message) || '').trim();
+    toast(!msg || /failed to fetch|network ?error|load failed/i.test(msg)
+      ? '网络异常，连不上本地服务' : msg, 'err');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = label;
+  }
 }
 
 /* ── 领取历史（卡片） ── */
@@ -1235,7 +1346,19 @@ const HISTORY_BADGE = {
   ratelimit: ['ratelimit', '限速'],
 };
 function renderHistory(items) {
-  const list = Array.isArray(items) ? items : [];
+  const src = Array.isArray(items) ? items : [];
+  // 最新的领取记录排在最上面（ts 为 YYYY-MM-DDTHH:MM:SS，可直接按字符串比较）
+  const list = src.slice().sort((a, b) => {
+    const ta = String((a && a.ts) || '');
+    const tb = String((b && b.ts) || '');
+    if (ta === tb) {
+      const ia = Number(a && a.task_id);
+      const ib = Number(b && b.task_id);
+      if (isFinite(ia) && isFinite(ib) && ia !== ib) return ib - ia;
+      return 0;
+    }
+    return ta < tb ? 1 : -1;
+  });
   const json = JSON.stringify(list);
   if (json === state.lastHistoryJson) return;
   state.lastHistoryJson = json;
@@ -1265,6 +1388,9 @@ function renderHistory(items) {
   box.appendChild(frag);
 
   $('historyEmpty').classList.toggle('hidden', list.length > 0);
+  state.lastHistoryItems = list.length;
+  const mst = $('mstMeta');
+  if (mst) mst.textContent = `${(state._tasksCache || []).length} / ${$('logList').children.length} / ${list.length}`;
 }
 
 /* ── 日志流 ── */
@@ -1275,11 +1401,12 @@ function appendLogEntry(l, animate) {
   line.appendChild(el('span', 'log-ts', l.ts || ''));
   line.appendChild(el('span', 'log-lv', level));
   line.appendChild(el('span', 'log-msg', l.msg != null ? String(l.msg) : ''));
-  list.appendChild(line);
-  while (list.children.length > LOG_CAP) list.removeChild(list.firstChild);
+  // 最新消息在最上面：新行插到列表头部，超出上限时从尾部淘汰最旧的
+  list.insertBefore(line, list.firstChild);
+  while (list.children.length > LOG_CAP) list.removeChild(list.lastChild);
   if (state.autoScroll) {
     const sc = $('logScroll');
-    sc.scrollTop = sc.scrollHeight;
+    sc.scrollTop = 0;
   } else {
     $('jumpBottom').classList.remove('hidden');
   }
@@ -1287,18 +1414,21 @@ function appendLogEntry(l, animate) {
 function renderLogsSnapshot(logs) {
   const list = Array.isArray(logs) ? logs : [];
   $('logList').textContent = '';
-  for (const l of list.slice(-LOG_CAP)) appendLogEntry(l, false);
+  // 后端给的是「旧 → 新」顺序，这里倒着插入，让最新一条排在最上面
+  const recent = list.slice(-LOG_CAP);
+  for (let i = recent.length - 1; i >= 0; i--) appendLogEntry(recent[i], false);
 }
 function setAutoScroll(v) {
   state.autoScroll = v;
   $('btnPauseScroll').textContent = v ? '暂停滚动' : '恢复滚动';
   $('jumpBottom').classList.toggle('hidden', v);
-  if (v) $('logScroll').scrollTop = $('logScroll').scrollHeight;
+  if (v) $('logScroll').scrollTop = 0;
 }
 function onLogScroll() {
   const sc = $('logScroll');
-  const nearBottom = sc.scrollHeight - sc.scrollTop - sc.clientHeight < 48;
-  if (nearBottom !== state.autoScroll) setAutoScroll(nearBottom);
+  // 最新日志在顶部：贴着顶部才视为「跟随最新」
+  const nearTop = sc.scrollTop < 48;
+  if (nearTop !== state.autoScroll) setAutoScroll(nearTop);
 }
 
 /* ── Token 弹层（用户账号） ── */
@@ -1521,6 +1651,30 @@ async function fetchTokenById(id, btn) {
     await loadCreds();
   }
 }
+/* 打开原网站并自动登录：后端新开一个 Edge 窗口并从上游取 token 注入。
+   接口要拉起浏览器，可能几秒才返回 → 按钮先进 disabled、先给一条 warn toast。 */
+async function openSiteForCred(c, btn) {
+  if (!c || c.id == null) return;
+  if (btn) {
+    btn.disabled = true;
+    btn.setAttribute('aria-busy', 'true');
+  }
+  toast('正在打开原网站…', 'warn');
+  try {
+    const r = await api(`/api/credentials/${c.id}/open-site`, { method: 'POST' });
+    // state 为 opened / already_open / starting 都算成功，直接念后端的人话文案
+    toast((r && r.message) || '已在浏览器中打开站点并自动登录', 'ok');
+    // 后端打开前可能顺手刷新了 token：同步一次顶栏状态（不重绘列表，避免按钮被换掉）
+    if (r && r.refreshed) refreshStatus();
+  } catch (err) {
+    toast('打开原网站失败：' + friendlyApiError(err), 'err');
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.removeAttribute('aria-busy');
+    }
+  }
+}
 async function onFetchAny() {
   const btn = $('btnFetchAny');
   btn.disabled = true;
@@ -1576,6 +1730,421 @@ async function syncClaimsForCred(credId, btn) {
     toast('核对失败：' + friendlyApiError(err), 'err');
   } finally {
     if (btn) btn.disabled = false;
+  }
+}
+
+/* ── 领取记录：进行中任务 / 所处阶段 ──
+   数据源 GET /api/claims（后端已按 cred 分组，stage_label 是后端给的中文，直接用，
+   前端不再维护第二份阶段文案）。
+   取数时机只有两个：展开账号卡片、点本区块的「刷新」。轮询 / 冷却重绘一律不碰，
+   拉到的整包缓存在 state.claims，重绘卡片时直接复用，不会重复打上游。 */
+const CLAIM_STAGE_TONE = {
+  to_submit: 'warm', reviewing: 'warm',            // 待办：暖色
+  retention: 'active', pending_settlement: 'active', // 进行中：中性青
+  settled: 'ok',                                    // 完成：绿
+  rejected: 'bad', abnormal: 'bad',                 // 失败：红
+  expired: 'mute', cancelled: 'mute', unknown: 'mute', // 终态：灰
+};
+
+function claimStageTone(stage) {
+  return CLAIM_STAGE_TONE[String(stage || '')] || 'mute';
+}
+
+/* 摘要里阶段的先后 = 生命周期顺序；中文名一律取后端给的 stage_label，前端不另写一份 */
+const CLAIM_STAGE_ORDER = ['to_submit', 'reviewing', 'retention', 'pending_settlement'];
+
+/* 某个登录账号自己的领取记录桶（按 claimed_at 倒序）；上游按账号报的错单独带回 */
+function claimsBucket(credId) {
+  const id = Number(credId);
+  const bucket = state.claims.byCred.get(id) || null;
+  const items = ((bucket && Array.isArray(bucket.items)) ? bucket.items : []).slice();
+  items.sort((a, b) => (Number(b.claimed_at) || 0) - (Number(a.claimed_at) || 0));
+  return {
+    loaded: !!state.claims.loaded,
+    stats: (bucket && bucket.stats) || {},
+    items,
+    error: state.claims.errors[String(id)] || '',
+  };
+}
+
+/* 归一化整包响应：以 by_cred 为准；by_cred 缺失或不全时用顶层 items 自己分组兜底 */
+function applyClaims(data) {
+  const map = new Map();
+  const byCred = (data && data.by_cred) || {};
+  for (const [key, val] of Object.entries(byCred)) {
+    const id = Number(key);
+    if (!isFinite(id)) continue;
+    map.set(id, {
+      fetchedAt: (val && val.fetched_at != null) ? Number(val.fetched_at) : null,
+      stats: (val && val.stats) || {},
+      items: ((val && Array.isArray(val.items)) ? val.items : [])
+        .filter((x) => x && typeof x === 'object'),
+    });
+  }
+  const raw = (data && Array.isArray(data.items)) ? data.items : [];
+  for (const it of raw) {
+    if (!it || it.cred_id == null) continue;
+    const id = Number(it.cred_id);
+    if (!isFinite(id)) continue;
+    if (!map.has(id)) map.set(id, { fetchedAt: null, stats: {}, items: [] });
+    const bucket = map.get(id);
+    const dup = bucket.items.some((x) => String(x.claim_id) === String(it.claim_id)
+      && String(x.cred_id) === String(it.cred_id) && String(x.submission_id) === String(it.submission_id));
+    if (!dup) bucket.items.push(it);
+  }
+  state.claims.byCred = map;
+  state.claims.errors = (data && data.errors) || {};
+  state.claims.fetchedAt = (data && data.fetched_at != null) ? Number(data.fetched_at) : null;
+  state.claims.loaded = true;
+  state.claims.loadedMs = Date.now();
+  state.claims.error = '';
+}
+
+/* 拉整包。refresh=true 才会真的去上游（几秒）。非 refresh 的请求会合流，
+   15 秒内重复展开直接吃缓存。失败时抛错，由调用方决定提示还是静默。 */
+let claimsPromise = null;
+async function loadClaims(refresh) {
+  if (!refresh) {
+    if (claimsPromise) return claimsPromise;
+    if (state.claims.loaded && Date.now() - (state.claims.loadedMs || 0) < 15000) return null;
+  }
+  const p = (async () => {
+    const data = await api('/api/claims' + (refresh ? '?refresh=true' : '?refresh=false'));
+    applyClaims(data);
+    return data;
+  })();
+  claimsPromise = p;
+  try {
+    return await p;
+  } finally {
+    if (claimsPromise === p) claimsPromise = null;
+  }
+}
+
+/* 领取记录的错文案：后端未就绪时 FastAPI 会回 {detail:"Not Found"} 这类英文原文，
+   直接丢给用户不成话；真上游的中文报错（后端给的 message/detail）则原样保留。 */
+function claimsErrorText(err) {
+  const raw = String((err && err.message) || '');
+  if (/^HTTP\s*\d{3}$/i.test(raw) || /^not found$/i.test(raw)
+    || /internal server error/i.test(raw) || /bad gateway/i.test(raw)
+    || /service unavailable/i.test(raw)) {
+    return '暂时无法获取';
+  }
+  return friendlyApiError(err);
+}
+
+/* 展开卡片时补一次：失败只记文案，不弹 toast（进页面不该报错） */
+function ensureClaimsLoaded(credId) {
+  const id = Number(credId);
+  if (!isFinite(id)) return;
+  if (state.claims.loaded && !state.claims.error) return;
+  loadClaims(false)
+    .catch((err) => { state.claims.error = claimsErrorText(err); })
+    .then(() => refreshClaimsMount(id));
+}
+
+/* 只重绘某账号的领取区块，不重建整张卡片 —— 刷新/加载完不该把 hover 与展开态打掉 */
+function refreshClaimsMount(credId) {
+  const id = Number(credId);
+  const nodes = document.querySelectorAll('[data-claims="' + id + '"]');
+  for (const node of nodes) fillClaimsBlock(node, id);
+}
+
+/* 时间口径按阶段分两路（实测：上游 expires_at = claimed_at + 24h，是「领取后要提交」的
+   截止，不是留存期结束 —— 真实数据里 4 天前、8 天前领取的留存期/待结算任务，expires_at
+   都已过去，但任务本身仍然健康。对这两类若照 expires_at 报「已过期」会与徽标自相矛盾）：
+   - 待提交 / 审核中：截止时间才是真信号，未到报「剩余」，过了报「已过期」
+   - 留存期 / 待结算等：报「已领取多久」，不拿已过去的提交截止当过期
+   - 非进行中：报「X前领取」 */
+const CLAIM_DEADLINE_STAGES = { to_submit: 1, reviewing: 1 };
+
+function claimTimeText(it, active) {
+  const now = Date.now();
+  const exp = Number(it && it.expires_at) * 1000;
+  const claimed = Number(it && it.claimed_at) * 1000;
+  const hasExp = isFinite(exp) && exp > 0;
+  const hasClaimed = isFinite(claimed) && claimed > 0;
+  const stage = String((it && it.stage) || '');
+
+  if (active !== true) {
+    return hasClaimed ? fmtRemain(Math.max(0, now - claimed)) + '前领取' : '';
+  }
+  if (CLAIM_DEADLINE_STAGES[stage] && hasExp) {
+    return exp <= now ? '已过期' : '剩余 ' + fmtRemain(exp - now);
+  }
+  if (hasClaimed) return '已领取 ' + fmtRemain(Math.max(0, now - claimed));
+  if (hasExp) return exp <= now ? '已过期' : '剩余 ' + fmtRemain(exp - now);
+  return '';
+}
+
+/* 摘要：进行中条数 + 阶段分布。
+   阶段分布一律按 items 自己聚合，不用上游 stats —— 两者口径有出入（实测 cred2 那条
+   「结算异常」被上游算进了 rejectedCount），照 stats 写会和下面的逐条徽标自相矛盾。 */
+function claimSummaryText(bucket, activeCount) {
+  const parts = ['进行中 ' + activeCount + ' 条'];
+  const groups = new Map();                     // stage -> {n, label}
+  for (const it of bucket.items) {
+    if (it.active !== true) continue;
+    const stage = String(it.stage || 'unknown');
+    const g = groups.get(stage) || { n: 0, label: it.stage_label || stage };
+    g.n += 1;
+    groups.set(stage, g);
+  }
+  const rank = (stage) => {
+    const i = CLAIM_STAGE_ORDER.indexOf(stage);
+    return i < 0 ? CLAIM_STAGE_ORDER.length : i;
+  };
+  const order = [...groups.keys()].sort((a, b) => rank(a) - rank(b));
+  for (const stage of order) {
+    const g = groups.get(stage);
+    parts.push(g.label + ' ' + g.n);
+  }
+  return parts.join(' · ');
+}
+
+/* 兜底对账：明细里一条进行中都没有、上游 stats 却仍记着进行中条数时，
+   单独标一行「上游统计」说明，绝不拿 stats 去改列表结论 */
+function claimStatsGap(bucket, activeCount) {
+  if (activeCount > 0) return '';
+  const s = bucket.stats || {};
+  const statActive = Number(s.toSubmitCount || 0) + Number(s.reviewingCount || 0)
+    + Number(s.retentionCount || 0) + Number(s.pendingSettlementCount || 0);
+  if (!(statActive > 0)) return '';
+  return '上游统计仍有 ' + statActive + ' 条进行中，但明细未返回';
+}
+
+/* 一条领取记录：徽标 + 单行省略的标题，下一行是平台 / 子账号 / 时间 / 浏览 */
+function claimRow(it) {
+  const row = el('div', 'acct-claim-row');
+  const label = it.stage_label || '未知阶段';
+
+  const head = el('div', 'acct-claim-head');
+  head.appendChild(el('span', 'acct-claim-stage tone-' + claimStageTone(it.stage), label));
+  const name = it.title || '未命名任务';
+  const title = el('span', 'acct-claim-title', name);
+  title.title = name + '（' + label + '）';
+  head.appendChild(title);
+  row.appendChild(head);
+
+  const sub = el('div', 'acct-claim-sub');
+  const platName = it.platform_name || it.platform || '';
+  if (platName) sub.appendChild(el('span', 'acct-claim-sub-plat', platName));
+  if (it.account_nickname) {
+    const acct = el('span', 'acct-claim-sub-acct', it.account_nickname);
+    if (it.platform_account_id != null) {
+      acct.appendChild(el('span', 'acct-claim-sub-id', ' #' + it.platform_account_id));
+    }
+    sub.appendChild(acct);
+  } else if (it.platform_account_id != null) {
+    sub.appendChild(el('span', 'acct-claim-sub-id', '#' + it.platform_account_id));
+  }
+  const when = claimTimeText(it, it.active === true);
+  if (when) sub.appendChild(el('span', 'acct-claim-sub-time', when));
+  const views = Number(it.view_count);
+  if (isFinite(views) && views > 0) sub.appendChild(el('span', 'acct-claim-sub-views', '浏览 ' + views));
+  if (sub.childNodes.length) row.appendChild(sub);
+  return row;
+}
+
+/* 进行中记录按平台子账号分组：组序照子账号行的先后；不在子账号列表里的 id 单独成组并标记，
+   绝不把这类记录丢掉（上游删号/换号时会遇到） */
+function claimGroupsFor(credId, active) {
+  const subs = platformSubAccounts(credId);
+  const rank = new Map();
+  const nameOf = new Map();
+  subs.forEach((s, i) => { rank.set(s.id, i); nameOf.set(s.id, s.name); });
+
+  const map = new Map();
+  for (const it of active) {
+    const raw = it.platform_account_id;
+    const pid = (raw != null && isFinite(Number(raw))) ? Number(raw) : null;
+    let g = map.get(pid == null ? 'none' : String(pid));
+    if (!g) {
+      g = { id: pid, known: pid == null ? null : rank.has(pid), name: '', items: [] };
+      map.set(pid == null ? 'none' : String(pid), g);
+    }
+    if (!g.name) g.name = nameOf.get(pid) || String(it.account_nickname || '');
+    g.items.push(it);
+  }
+
+  const list = [...map.values()];
+  list.sort((a, b) => {
+    const ra = (a.id != null && rank.has(a.id)) ? rank.get(a.id) : 1e6;
+    const rb = (b.id != null && rank.has(b.id)) ? rank.get(b.id) : 1e6;
+    return ra - rb;
+  });
+  return list;
+}
+
+/* 一个子账号分组：小标题（#id · 昵称，右侧条数）+ 该组的任务行 */
+function claimGroupBlock(g) {
+  const wrap = el('div', 'acct-claim-group');
+
+  const head = el('div', 'acct-claim-grp-head');
+  const nameText = g.id == null ? '未标记子账号' : ('#' + g.id + (g.name ? ' · ' + g.name : ''));
+  const nameEl = el('span', 'acct-claim-grp-name', nameText);
+  nameEl.title = nameText;
+  head.appendChild(nameEl);
+  if (g.known === false) {
+    const note = el('span', 'acct-claim-grp-note', '不在子账号列表');
+    note.title = '领取记录里这个子账号不在该账号的平台子账号列表中（可能已删号或换号）';
+    head.appendChild(note);
+  }
+  head.appendChild(el('span', 'acct-claim-grp-count', '进行中 ' + g.items.length));
+  wrap.appendChild(head);
+
+  const list = el('div', 'acct-claim-list');
+  for (const it of g.items) list.appendChild(claimRow(it));
+  wrap.appendChild(list);
+  return wrap;
+}
+
+/* 本卡片的作用域：state.filters.platformAccountId 指向本卡片的子账号时才生效 */
+function scopedPlatAccountIdFor(credId, bucket) {
+  if (state.filters.platformAccountId == null) return null;
+  const want = Number(state.filters.platformAccountId);
+  if (!isFinite(want)) return null;
+  if (platformSubAccounts(credId).some((s) => s.id === want)) return want;
+  // 子账号列表里没有、但领取记录里确实有这个 id（删号/换号）也认
+  if (bucket.items.some((x) => Number(x.platform_account_id) === want)) return want;
+  return null;
+}
+
+/* 填充一个领取记录区块（可在原地反复调用；只有这块 DOM 会被替换） */
+function fillClaimsBlock(box, credId) {
+  const id = Number(credId);
+  box.textContent = '';
+  box.dataset.claims = String(id);
+
+  const bucket = claimsBucket(id);
+  // 作用域：任务速览筛了本卡片的某个子账号时，本区块跟着切到该子账号视角
+  const scopeId = scopedPlatAccountIdFor(id, bucket);
+  const activeAll = bucket.items.filter((x) => x.active === true);
+  const active = scopeId == null
+    ? activeAll
+    : activeAll.filter((x) => Number(x.platform_account_id) === scopeId);
+  const pastAll = bucket.items.filter((x) => x.active !== true);
+  // 已结束记录仍是平铺，但跟着作用域一起收窄，免得在「只看 #id」里冒出别的子账号的记录
+  const past = scopeId == null
+    ? pastAll
+    : pastAll.filter((x) => Number(x.platform_account_id) === scopeId);
+
+  const titleRow = el('div', 'acct-plat-title-row');
+  titleRow.appendChild(el('div', 'acct-plat-title', '进行中任务'));
+  const btn = el('button', 'mini-btn', '刷新');
+  btn.type = 'button';
+  btn.title = '向上游重新拉取领取记录（真实请求，可能要几秒）';
+  btn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    refreshClaimsFor(id, btn);
+  });
+  titleRow.appendChild(btn);
+  if (scopeId != null) {
+    const chip = el('span', 'acct-claim-scope', '✕ 只看 #' + scopeId);
+    chip.title = '取消筛选，显示该账号全部子账号的进行中任务';
+    chip.addEventListener('click', (e) => {
+      e.stopPropagation();
+      state.filters.platformAccountId = null;
+      renderLoginAccounts();
+    });
+    titleRow.appendChild(chip);
+  }
+  box.appendChild(titleRow);
+
+  const fatal = state.claims.error;
+  const broken = fatal || bucket.error;
+
+  // 摘要口径跟着作用域走：筛了子账号就只说该子账号，不把账号级数字挂上去
+  if (bucket.loaded && !broken && (scopeId == null || active.length > 0)) {
+    const summary = scopeId == null
+      ? claimSummaryText(bucket, active.length)
+      : claimSummaryText({ items: active }, active.length) + ' · 该子账号';
+    box.appendChild(el('div', 'acct-claim-summary', summary));
+  }
+
+  if (broken) {
+    // friendlyApiError 对 404/5xx 已经给出「暂时无法获取」，别把同一句话叠两遍
+    const text = fatal
+      ? ('领取记录暂时无法获取' + (fatal && fatal !== '暂时无法获取' ? '：' + fatal : ''))
+      : ('该账号的领取记录暂时无法获取（' + bucket.error + '）');
+    box.appendChild(el('div', 'acct-claim-empty err', text));
+    return;
+  }
+  if (!bucket.loaded) {
+    box.appendChild(el('div', 'acct-claim-empty', '正在读取领取记录…'));
+    return;
+  }
+
+  if (!active.length) {
+    box.appendChild(el('div', 'acct-claim-empty',
+      scopeId == null ? '暂无进行中任务' : '该子账号暂无进行中任务'));
+  } else if (scopeId != null) {
+    // 单子账号视角：不再套分组标题，列表整平（筛选提示已经在标题行上）
+    const list = el('div', 'acct-claim-list');
+    for (const it of active) list.appendChild(claimRow(it));
+    box.appendChild(list);
+  } else {
+    const groups = claimGroupsFor(id, active);
+    // 只有一个「没标子账号」的组时不必加标题，保持原来的平铺观感
+    const grouped = groups.length > 1 || (groups.length === 1 && groups[0].id != null);
+    if (grouped) {
+      for (const g of groups) box.appendChild(claimGroupBlock(g));
+    } else {
+      const list = el('div', 'acct-claim-list');
+      for (const it of active) list.appendChild(claimRow(it));
+      box.appendChild(list);
+    }
+  }
+
+  // 与上游 stats 的差异只在这里说一句，且明确标成「上游统计」；上游 stats 是账号级的，
+  // 因此只在未筛选（账号视角）时才说，别把账号级差异挂到子账号视角上
+  if (scopeId == null) {
+    const gap = claimStatsGap(bucket, active.length);
+    if (gap) box.appendChild(el('div', 'acct-claim-note', gap));
+  }
+
+  if (past.length > 0) {
+    const open = state.claimsOpen.has(id);
+    if (open) {
+      const list = el('div', 'acct-claim-list acct-claim-list-past');
+      for (const it of past) list.appendChild(claimRow(it));
+      box.appendChild(list);
+    }
+    const more = el('button', 'acct-claim-more', open ? '收起' : '全部领取 ' + past.length);
+    more.type = 'button';
+    more.title = open ? '只看进行中的任务' : '展开已结束（已结算 / 未通过 / 已过期）的领取记录';
+    more.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (open) state.claimsOpen.delete(id); else state.claimsOpen.add(id);
+      fillClaimsBlock(box, id);
+    });
+    box.appendChild(more);
+  }
+}
+
+/* 账号卡片展开区的领取记录外壳（样式与平台子账号面板同源，见 .acct-claims） */
+function renderClaimsBlock(c) {
+  const box = el('div', 'acct-claims');
+  fillClaimsBlock(box, c.id);
+  return box;
+}
+
+/* 「刷新」：真去上游拉一次。按钮 disabled + 文案切换，回来报条数 */
+async function refreshClaimsFor(credId, btn) {
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = '刷新中…';
+  }
+  try {
+    await loadClaims(true);
+    const n = claimsBucket(credId).items.filter((x) => x.active === true).length;
+    toast(n > 0 ? '已刷新 ' + n + ' 条进行中' : '已刷新，暂无进行中任务', 'ok');
+  } catch (err) {
+    const msg = claimsErrorText(err);
+    if (!state.claims.loaded) state.claims.error = msg;   // 有旧数据就留着，只提示
+    toast(msg, 'err');
+  } finally {
+    refreshClaimsMount(Number(credId));
   }
 }
 
@@ -1639,6 +2208,32 @@ function connectSSE() {
   es.onerror = () => setConnected(false);
 }
 
+/* ── 手机端视图切换（账号 / 任务 / 记录 / 设置） ── */
+function setMobileView(view) {
+  document.body.dataset.mview = view;
+  const nav = $('mobileNav');
+  if (nav) {
+    nav.querySelectorAll('.mnav-item').forEach((b) => {
+      b.classList.toggle('active', b.dataset.view === view);
+    });
+  }
+  if (view === 'settings') {
+    // 设置 tab 打开账号配置弹层，同时保持账号视图为底
+    openTokenModal();
+    document.body.dataset.mview = 'accounts';
+    const nav2 = $('mobileNav');
+    if (nav2) nav2.querySelectorAll('.mnav-item').forEach((b) => b.classList.toggle('active', b.dataset.view === 'accounts'));
+  }
+}
+function toggleSecondary(force) {
+  const btn = $('mobileSecondaryToggle');
+  if (!btn) return;
+  const open = force != null ? force : document.body.dataset.secondary !== 'open';
+  document.body.dataset.secondary = open ? 'open' : 'closed';
+  btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+  if (open) setMobileView('tasks');
+}
+
 /* ── 主题（浅色/深色，localStorage 记忆） ── */
 const THEME_KEY = 'sniper-theme';
 function applyTheme(t) {
@@ -1660,6 +2255,9 @@ function initTheme() {
 (async function init() {
   initTheme();
 
+  // 手机端默认视图：账号主区
+  if (!document.body.dataset.mview) document.body.dataset.mview = 'accounts';
+
   // 日志区交互
   $('logScroll').addEventListener('scroll', onLogScroll);
   $('btnPauseScroll').addEventListener('click', () => setAutoScroll(!state.autoScroll));
@@ -1669,7 +2267,6 @@ function initTheme() {
   // 顶栏动作 / Token（用户账号）
   $('btnStart').addEventListener('click', () => act('/api/start', '狙击已启动'));
   $('btnStop').addEventListener('click', () => act('/api/stop', '已停止'));
-  $('tokenBadge').addEventListener('click', openTokenModal);
   $('tokenClose').addEventListener('click', closeTokenModal);
   $('btnAddAccount').addEventListener('click', openTokenModal);
 
@@ -1709,12 +2306,13 @@ function initTheme() {
     if (btn.scrollIntoView) btn.scrollIntoView({ block: 'nearest', inline: 'nearest' });
   });
   $('filterReset').addEventListener('click', () => {
+    // 只清平台筛选：账号作用域属于账号卡片内的「进行中任务」，不在本区语义内
     state.filters.platform = null;
-    state.filters.platformAccountId = null;
-    renderLoginAccounts();
     renderTaskBoard();
   });
   $('onlyClaimable').addEventListener('change', (e) => { state.filters.onlyClaimable = e.target.checked; renderTaskBoard(); });
+  // 任务速览「刷新」：手动向上游拉一次任务列表，不用等自动轮询
+  $('btnRefreshTasks').addEventListener('click', (e) => refreshTasksManual(e.currentTarget));
 
   // 活动面板切换
   $('tabs').addEventListener('click', (e) => {
@@ -1724,6 +2322,19 @@ function initTheme() {
     $('logPanel').classList.toggle('hidden', tab !== 'logs');
     $('historyPanel').classList.toggle('hidden', tab !== 'history');
   });
+
+  // 手机端底部导航
+  const mnav = $('mobileNav');
+  if (mnav) {
+    mnav.addEventListener('click', (e) => {
+      const btn = e.target.closest('.mnav-item');
+      if (!btn) return;
+      setMobileView(btn.dataset.view);
+    });
+  }
+  // 手机端次级折叠条
+  const mstBtn = $('mobileSecondaryToggle');
+  if (mstBtn) mstBtn.addEventListener('click', () => toggleSecondary());
 
   // 初始并行加载
   try {
@@ -1741,6 +2352,8 @@ function initTheme() {
   await loadCreds();
   // 刷新页面后也立即展示每个登录账号名下的平台子账号
   await loadPlatformByLogin();
+  // 默认展开的那张卡片：补一次领取记录（整包只拉一次，之后吃缓存）
+  if (state.expandedAccountId != null) ensureClaimsLoaded(state.expandedAccountId);
 
   connectSSE();
 

@@ -301,6 +301,69 @@ def _as_float(value: Any) -> Optional[float]:
         return None
 
 
+#: 领取记录里「进行中」的阶段键（与上游 stats 对齐）
+ACTIVE_STAGE_KEYS = ("to_submit", "reviewing", "retention", "pending_settlement")
+#: 阶段键 -> 中文标签（前端直接展示用）
+STAGE_LABELS = {
+    "to_submit": "待提交", "reviewing": "审核中", "retention": "留存期",
+    "pending_settlement": "待结算", "settled": "已结算", "rejected": "未通过",
+    "expired": "已过期", "cancelled": "已取消", "abnormal": "结算异常",
+}
+
+
+def claim_stage(status: Any, settlement: Any,
+                has_submission: bool) -> tuple:
+    """把 ``(claim.status, settlement.status, 是否有提交)`` 映射成 ``(stage_key, 中文标签)``。
+
+    按顺序判定，取第一个命中的：
+
+      1) settlement 是 dict 且其 ``status == "abnormal"``       → abnormal / 结算异常
+      2) status == "settled" 或 settlement.status == "paid"     → settled / 已结算
+      3) status == "rejected"                                   → rejected / 未通过
+      4) status == "expired"                                    → expired / 已过期
+      5) status == "cancelled"                                  → cancelled / 已取消
+      6) settlement.status == "retention_pending"               → retention / 留存期
+      7) settlement 是 dict（未被上面命中，含 pending 等）        → pending_settlement / 待结算
+      8) 有提交（has_submission）                                → reviewing / 审核中
+      9) 其余（claimed 且无提交）                                 → to_submit / 待提交
+
+    未知 status 且无 settlement 且无提交 → ``("unknown", str(status or "未知"))``。
+    """
+    stat = str(status or "").strip()
+    settle_status = ""
+    if isinstance(settlement, dict):
+        settle_status = str(settlement.get("status") or "").strip()
+    # 1) 结算异常优先级最高（钱出了问题，无论 claim 本身什么状态都要人看）
+    if settle_status == "abnormal":
+        return ("abnormal", STAGE_LABELS["abnormal"])
+    # 2) 已结算
+    if stat == "settled" or settle_status == "paid":
+        return ("settled", STAGE_LABELS["settled"])
+    # 3) 未通过
+    if stat == "rejected":
+        return ("rejected", STAGE_LABELS["rejected"])
+    # 4) 已过期
+    if stat == "expired":
+        return ("expired", STAGE_LABELS["expired"])
+    # 5) 已取消
+    if stat == "cancelled":
+        return ("cancelled", STAGE_LABELS["cancelled"])
+    # 6) 留存期（approved 且结算处于留存待结）
+    if settle_status == "retention_pending":
+        return ("retention", STAGE_LABELS["retention"])
+    # 7) 待结算：只要 settlement 是 dict 且未被上面命中（pending / 其它）都算
+    if isinstance(settlement, dict):
+        return ("pending_settlement", STAGE_LABELS["pending_settlement"])
+    # 8) 有提交 → 审核中
+    if has_submission:
+        return ("reviewing", STAGE_LABELS["reviewing"])
+    # 9) claimed/approved 且无提交 → 待提交
+    if stat in ("claimed", "approved"):
+        return ("to_submit", STAGE_LABELS["to_submit"])
+    # 未知 status（含空）且无 settlement 无提交
+    return ("unknown", stat or "未知")
+
+
 def _iso_to_epoch(value: Any) -> Optional[float]:
     """ISO 时间（带 Z / 偏移 / 本地）→ epoch 秒；解析失败返回 None。"""
     if value in (None, ""):
@@ -615,6 +678,9 @@ class SniperEngine:
         # 单账号轮询（single_poller）状态：当前轮询账号 + 上次轮转时刻（monotonic）
         self._poll_cred: Optional[int] = None
         self._poll_cred_at: float = 0.0
+        # 手动刷新防重入：与轮询线程共用 _ingest（自带锁），这里只挡两次手动刷新并发
+        self._refresh_lock = threading.Lock()
+        self._refresh_inflight = False
         self._claim_threads: list = []
         self._claim_stops: list = []
         self._limits_thread: Optional[threading.Thread] = None
@@ -625,6 +691,10 @@ class SniperEngine:
         self._request_cooldowns: dict = {}     # cred_id -> 请求冷却（10s 级）
         self._task_cooldowns: dict = {}        # (平台子账号id, 任务id) -> 任务冷却（3天级）
         self._pending_submissions: dict = {}   # (平台子账号id, 任务id) -> 待提交
+        # 领取记录（/api/user/claims）归一化缓存：cred_id -> {"fetched_at","items","stats","total"}
+        self._claims: dict = {}
+        # 最近一次拉取失败原因：cred_id -> 错误串（供快照暴露给前端）
+        self._claim_errors: dict = {}
         self._load_cooldowns_state()
 
         # 异步文件日志
@@ -964,6 +1034,8 @@ class SniperEngine:
             self._request_cooldowns.clear()
             self._task_cooldowns.clear()
             self._pending_submissions.clear()
+            self._claims.clear()
+            self._claim_errors.clear()
             self._account_cursor = 0
             self._clock_offset_ms = 0.0
             self._rtt_ms = 0.0
@@ -1118,6 +1190,7 @@ class SniperEngine:
             "request_cooldowns": self.request_cooldowns(),
             "task_cooldowns": self.task_cooldowns(),
             "pending_submissions": self.pending_submissions(),
+            "claims": self.claims_snapshot(),
             "account_inflight": {str(aid): int(n)
                                  for aid, n in self._account_inflight.items() if n},
         }
@@ -1775,6 +1848,8 @@ class SniperEngine:
                     "items": 0, "updated": 0}
         data = obj.get("data")
         items = (data.get("items") if isinstance(data, dict) else None) or []
+        stats = (data.get("stats") if isinstance(data, dict) else None) or {}
+        total = data.get("total") if isinstance(data, dict) else None
         now = time.time()
         updated = 0
         pending_count = 0
@@ -1802,8 +1877,162 @@ class SniperEngine:
                 self._clear_pending(aid, tid, persist=False)
             updated += 1
         self._save_cooldowns_state()
+        self._store_claims(cid, items, stats, total)
         return {"ok": True, "items": len(items), "updated": updated,
-                "pending": pending_count, "error": None}
+                "pending": pending_count, "error": None,
+                "claims": self.claims_snapshot()["by_cred"].get(str(cid))}
+
+    # ========================= 领取记录（任务展示） =========================
+    def _normalize_claim(self, item: dict, cred_id: int) -> Optional[dict]:
+        """把上游领取记录归一化成对外唯一形状；非 dict / 缺 taskId 返回 None（跳过）。"""
+        if not isinstance(item, dict):
+            return None
+        raw_task_id = item.get("taskId")
+        if raw_task_id is None:
+            return None
+        try:
+            task_id: Optional[int] = int(raw_task_id)
+        except Exception:
+            task_id = None
+        try:
+            claim_id: Optional[int] = int(item.get("id"))
+        except Exception:
+            claim_id = None
+        try:
+            pacct_id: Optional[int] = int(item.get("platformAccountId"))
+        except Exception:
+            pacct_id = None
+        task = item.get("task") if isinstance(item.get("task"), dict) else {}
+        submission = (item.get("latestSubmission")
+                      if isinstance(item.get("latestSubmission"), dict) else None)
+        settlement = (item.get("settlement")
+                      if isinstance(item.get("settlement"), dict) else None)
+        status = str(item.get("status") or "")
+        stage, stage_label = claim_stage(status, settlement, submission is not None)
+        view_count = submission.get("viewCount") if submission else None
+        if isinstance(view_count, bool) or not isinstance(view_count, (int, float)):
+            try:
+                view_count = int(view_count) if view_count not in (None, "") else None
+            except Exception:
+                view_count = None
+        else:
+            view_count = int(view_count)
+        try:
+            sub_id: Optional[int] = int(submission.get("id")) if submission else None
+        except Exception:
+            sub_id = None
+        return {
+            "cred_id": int(cred_id),
+            "claim_id": claim_id,
+            "task_id": task_id,
+            "title": str(task.get("title") or ""),
+            "task_type": str(item.get("taskType") or ""),
+            "task_type_name": str(item.get("taskTypeName") or ""),
+            "platform": str(item.get("platform") or ""),
+            "platform_name": str(item.get("platformName") or ""),
+            "platform_account_id": pacct_id,
+            "account_nickname": str(item.get("accountNickname") or ""),
+            "status": status,
+            "stage": stage,
+            "stage_label": stage_label,
+            "active": stage in ACTIVE_STAGE_KEYS,
+            "claimed_at": _iso_to_epoch(item.get("claimedAt")),
+            "expires_at": _iso_to_epoch(item.get("expiresAt")),
+            "submission_id": sub_id,
+            "view_count": view_count,
+            "settlement_status": str(settlement.get("status") or "") if settlement else "",
+            "settlement_amount": str(settlement.get("totalAmount") or "") if settlement else "",
+        }
+
+    def _store_claims(self, cid: int, items: Any, stats: Any,
+                      total: Any) -> list:
+        """把上游 items 归一化后写入 ``self._claims[cid]``（成功路径共用）。"""
+        norm = []
+        for it in items or []:
+            rec = self._normalize_claim(it, cid)
+            if rec is not None:
+                norm.append(rec)
+        with self._lock:
+            self._claims[int(cid)] = {
+                "fetched_at": time.time(),
+                "items": norm,
+                "stats": dict(stats) if isinstance(stats, dict) else {},
+                "total": total,
+            }
+            self._claim_errors.pop(int(cid), None)
+        return norm
+
+    def fetch_claims(self, cred_id: Any, page_size: int = 20) -> dict:
+        """拉一次某账号的领取记录并更新展示缓存。
+
+        失败（无 token / 网络 / 非 200）返回 ``ok=False`` 且**保留上一次成功快照**，
+        只在失败时打一条 WARN（成功由周期刷新调用，刷日志会刷屏）。
+        """
+        store = self._get_store()
+        try:
+            cid = int(cred_id)
+        except Exception:
+            return {"ok": False, "error": "bad_id", "items": []}
+        token = store.get_token(cid) if store else None
+        if not token:
+            return {"ok": False, "error": "no_token", "items": []}
+        try:
+            status, obj = self._api_call(
+                "GET", f"/api/user/claims?page=1&pageSize={int(page_size)}",
+                token=token, kind="plat")
+        except Exception as exc:
+            with self._lock:
+                self._claim_errors[cid] = f"网络异常：{exc}"
+            self._log(f"账号 {cid} 领取记录拉取失败：网络异常", "WARN")
+            return {"ok": False, "error": "network", "items": []}
+        if status != 200 or not isinstance(obj, dict):
+            err = f"HTTP {status}" if status else "network"
+            with self._lock:
+                self._claim_errors[cid] = err
+            self._log(f"账号 {cid} 领取记录拉取失败：{err}", "WARN")
+            return {"ok": False, "error": err, "items": []}
+        data = obj.get("data")
+        items = (data.get("items") if isinstance(data, dict) else None) or []
+        stats = (data.get("stats") if isinstance(data, dict) else None) or {}
+        total = data.get("total") if isinstance(data, dict) else None
+        norm = self._store_claims(cid, items, stats, total)
+        return {"ok": True, "items": norm, "stats": stats, "total": total,
+                "error": None}
+
+    def claims_snapshot(self) -> dict:
+        """所有账号领取记录的聚合快照（便宜：浅拷贝 + 拼接，供 SSE 频繁调用）。"""
+        with self._lock:
+            by_cred_raw = {str(cid): dict(rec)
+                           for cid, rec in self._claims.items()}
+            errors = dict(self._claim_errors)
+        by_cred: dict = {}
+        merged: list = []
+        fetched_at: Optional[float] = None
+        active_count = 0
+        for key, rec in by_cred_raw.items():
+            items = list(rec.get("items") or [])
+            entry = {
+                "fetched_at": rec.get("fetched_at"),
+                "stats": dict(rec.get("stats") or {}),
+                "items": items,
+            }
+            by_cred[key] = entry
+            fa = rec.get("fetched_at")
+            if isinstance(fa, (int, float)) and (fetched_at is None or fa > fetched_at):
+                fetched_at = float(fa)
+            for it in items:
+                if it.get("active"):
+                    active_count += 1
+            merged.extend(items)
+        merged.sort(key=lambda it: (it.get("claimed_at") is None,
+                                    -(it.get("claimed_at") or 0.0)))
+        return {
+            "fetched_at": fetched_at,
+            "items": merged,
+            "by_cred": by_cred,
+            "errors": {str(k): str(v) for k, v in errors.items()},
+            "active_count": active_count,
+        }
 
     def _fetch_limits(self, cfg: EngineConfig, kind: str = "limits",
                       cred_id: Any = 0) -> dict:
@@ -1869,7 +2098,7 @@ class SniperEngine:
     def platform_accounts(self, platform: Optional[str] = None,
                           token: Optional[str] = None,
                           kind: str = "plat") -> dict:
-        """已发现的平台子账号（用于抢任务的 小红书/抖音/快手 等）。
+        """已发现的平台子账号（用于抢任务的 小红书/抖音/快手/微信视频号 等）。
 
         汇总来源：① 任务 ``claimEligibility.accounts``（带 id，可能无名称）；
         ② 上游 ``{base}/api/user/platform-accounts``（即 ``/pages/accounts/index``
@@ -1953,8 +2182,8 @@ class SniperEngine:
 
         字段对照（来自 ``/pages/accounts/index`` 调用的接口，已在 HAR 中确认）：
           id           平台账号 id
-          platform     "xiaohongshu" / "douyin" / "kuaishou" 等（小写代码）
-          platformName "小红书" / "抖音" / "快手"（中文）
+          platform     "xiaohongshu" / "douyin" / "kuaishou" / "wx_channels" 等（小写代码）
+          platformName "小红书" / "抖音" / "快手" / "wx视频号"（中文）
           account      账号标识（如绑定的手机号/账号名）
           realName     实名
           verifyStatus "verified" 等
@@ -2394,10 +2623,16 @@ class SniperEngine:
         return pick
 
     def _poll_once(self, cred_id: Any, task_type: str,
-                   cfg: EngineConfig) -> None:
-        """轮询一个登录账号的一种任务类型；默认只取列表最后 N 页（最新）。"""
+                   cfg: EngineConfig, allow_idle: bool = False) -> int:
+        """轮询一个登录账号的一种任务类型；默认只取列表最后 N 页（最新）。
+
+        返回本轮成功入库的页数（HTTP 200 的页数）。``allow_idle=True`` 时
+        即使引擎处于停止态也继续拉完（供手动刷新用）；默认行为不变，轮询
+        线程仍受 ``_is_active`` 控制。
+        """
         cid = int(cred_id)
         key = (cid, str(task_type))
+        ingested_pages = 0
         state = self._poll_state.setdefault(key, {
             "total": None, "page_size": None, "last_total": 0.0,
             "backfilled": False,
@@ -2414,10 +2649,10 @@ class SniperEngine:
                 cid, task_type, 1, cfg, page_size)
             if status == -1:
                 self._bump("skipped")
-                return
+                return 0
             if status == 401:
                 self._poll_auth_failed(cid)
-                return
+                return 0
             self._bump("polls")
             if status == 200:
                 page1_items = items
@@ -2451,8 +2686,8 @@ class SniperEngine:
                 continue
             if page in fetched:
                 continue
-            if not self._is_active():
-                return
+            if not allow_idle and not self._is_active():
+                return ingested_pages
             status, items, meta = self._get_tasks(
                 cid, task_type, page, cfg, page_size)
             if status == -1:
@@ -2462,10 +2697,11 @@ class SniperEngine:
                 continue
             if status == 401:
                 self._poll_auth_failed(cid)
-                return
+                return ingested_pages
             self._bump("polls")
             if status == 200:
                 self._ingest(task_type, items, cid, (page - 1) * page_size)
+                ingested_pages += 1
                 if meta.get("total") is not None:
                     state["total"] = int(meta["total"])
                 self._clear_error()
@@ -2474,6 +2710,69 @@ class SniperEngine:
         if page1_items is not None and 1 not in pages:
             self._ingest(task_type, page1_items, cid,
                          (int(cfg.page_size) if cfg.page_size else 0))
+            ingested_pages += 1
+        return ingested_pages
+
+    def refresh_tasks_once(self, timeout: float = 25.0) -> dict:
+        """手动拉一次任务列表：对每个登录账号 × 每种任务类型各跑一轮。
+
+        与轮询线程共用 ``_ingest``（自带锁），这里不再包大锁；只用一个独立
+        布尔标志防两次手动刷新并发。引擎停止时也能跑完（``allow_idle=True``）。
+        整体受 ``timeout`` 秒上限保护，超时就把已完成的部分照常入库并返回。
+        """
+        started = time.monotonic()
+        with self._refresh_lock:
+            if self._refresh_inflight:
+                return {"ok": False, "accounts": 0, "types": [],
+                        "fetched_pages": 0, "tasks": len(self.tasks().get("items") or []),
+                        "errors": ["已有一次手动刷新在进行中，请稍候"],
+                        "elapsed": round(time.monotonic() - started, 3)}
+            self._refresh_inflight = True
+        try:
+            return self._refresh_tasks_once_locked(timeout, started)
+        finally:
+            with self._refresh_lock:
+                self._refresh_inflight = False
+
+    def _refresh_tasks_once_locked(self, timeout: float, started: float) -> dict:
+        cfg = self._cfg
+        types = [str(t) for t in (cfg.task_types or ())]
+        targets = self._poll_targets()
+        errors: list = []
+        fetched_pages = 0
+        if not targets:
+            self._log("手动拉取任务列表：没有可用的 Token", "WARN")
+            return {"ok": False, "accounts": 0, "types": types,
+                    "fetched_pages": 0,
+                    "tasks": len(self.tasks().get("items") or []),
+                    "errors": ["没有可用的 Token，先在账号里取 Token"],
+                    "elapsed": round(time.monotonic() - started, 3)}
+        for cid, _tok in targets:
+            for task_type in types:
+                if time.monotonic() - started >= float(timeout):
+                    errors.append(f"账号 #{cid}：手动刷新超时（>{timeout:.0f}s），已停止继续拉取")
+                    break
+                try:
+                    fetched_pages += int(self._poll_once(cid, task_type, cfg,
+                                                         allow_idle=True) or 0)
+                except Exception as exc:
+                    errors.append(f"账号 #{cid}（{task_type}）：{exc}")
+                    self._log(f"手动拉取任务列表：账号 #{cid} 类型 {task_type} 失败：{exc}",
+                              "WARN")
+            else:
+                continue
+            break
+        self._flush_tasks_emit()
+        elapsed = round(time.monotonic() - started, 3)
+        task_count = len(self.tasks().get("items") or [])
+        ok = fetched_pages > 0 or not errors
+        self._log(f"手动拉取任务列表：账号 {len(targets)} 个 × 类型 {len(types)} 种，"
+                  f"成功入库 {fetched_pages} 页，用时 {elapsed:.1f}s", "INFO")
+        for err in errors:
+            self._log(f"手动拉取任务列表：{err}", "WARN")
+        return {"ok": ok, "accounts": len(targets), "types": types,
+                "fetched_pages": fetched_pages, "tasks": task_count,
+                "errors": errors, "elapsed": elapsed}
 
     # ============================ 入库 / 入队 ============================
     def _pick_account(self, item: dict) -> Optional[int]:

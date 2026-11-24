@@ -566,6 +566,32 @@ def get_tasks(request: Request) -> dict:
     return _engine(request).tasks()
 
 
+@app.post("/api/tasks/refresh")
+async def post_tasks_refresh(request: Request) -> dict:
+    """手动拉一次任务列表（供「任务速览」刷新按钮）。
+
+    对每个有 Token 的账号 × 每种任务类型各跑一轮，引擎停止时也能拉。
+    不抛 5xx：失败原因收集进 ``errors`` 由前端展示；只有引擎内部异常才 500。
+    """
+    engine = _engine(request)
+    result = await asyncio.to_thread(engine.refresh_tasks_once)
+    if not isinstance(result, dict):
+        result = {}
+    tasks = engine.tasks()
+    items = tasks.get("items") or []
+    return {
+        "ok": bool(result.get("ok")),
+        "accounts": int(result.get("accounts") or 0),
+        "types": list(result.get("types") or []),
+        "tasks": tasks,
+        "count": len(items),
+        "fetched_pages": int(result.get("fetched_pages") or 0),
+        "errors": list(result.get("errors") or []),
+        "fetched_at": time.time(),
+        "elapsed": float(result.get("elapsed") or 0.0),
+    }
+
+
 @app.get("/api/history")
 def get_history(request: Request) -> dict:
     return {"items": _engine(request).history()}
@@ -573,7 +599,7 @@ def get_history(request: Request) -> dict:
 
 @app.get("/api/platform-accounts")
 def get_platform_accounts(request: Request, platform: Optional[str] = None) -> dict:
-    """已发现的平台子账号（用于抢任务的 小红书/抖音/快手 等）。
+    """已发现的平台子账号（用于抢任务的 小红书/抖音/快手/微信视频号 等）。
 
     无 ``platform`` 返回全部；带值时返回该平台子集；若上游未标注平台归属，
     则回退返回全部并置 ``fallback=True``（前端据此提示）。任何失败均无日志噪音。
@@ -745,6 +771,29 @@ def post_fetch_token(cred_id: int, request: Request, activate: bool = True) -> d
     return result
 
 
+@app.post("/api/credentials/{cred_id}/open-site")
+def post_open_site(cred_id: int, request: Request, headless: bool = False) -> dict:
+    """用该账号的 Token 打开上游站点并自动登录（新开浏览器窗口）。
+
+    Token 在页面脚本执行前注入 ``localStorage``，站点后续请求自带 Bearer，
+    因此打开即是登录态。``headless=true`` 时无窗口（仅调试用）。
+    """
+    manager = request.app.state.login_manager
+    if request.app.state.credentials.get(cred_id) is None:
+        raise HTTPException(status_code=404, detail="凭据不存在")
+    try:
+        result = manager.open_site(cred_id, headless=headless)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    upstream_error = bool(result.pop("_upstream_error", False))
+    if not result.get("ok"):
+        error = result.get("error") or ""
+        if upstream_error or is_upstream_error(error):
+            raise HTTPException(status_code=502, detail=error or "上游服务错误")
+        raise HTTPException(status_code=503, detail=error or "无法打开站点")
+    return result
+
+
 @app.post("/api/credentials/{cred_id}/refresh-platform-accounts")
 def post_refresh_platform_accounts(cred_id: int, request: Request) -> dict:
     """刷新单个账号名下的全部平台子账号（一次上游调用，结果写缓存）。"""
@@ -767,6 +816,40 @@ def post_refresh_platform_accounts(cred_id: int, request: Request) -> dict:
     }
 
 
+@app.get("/api/claims")
+def get_claims(request: Request, refresh: bool = False) -> dict:
+    """进行中/历史任务（领取记录）。``refresh=true`` 时先强制拉一次上游。
+
+    refresh 会对所有**有 token** 的凭据逐个拉取（串行打上游，可能几秒），
+    单个失败不抛，只收集进 ``errors``；返回值始终是引擎聚合快照 + ``ok``。
+    """
+    engine = _engine(request)
+    errors: dict = {}
+    if refresh:
+        store = engine._get_store()
+        for record in store.list_all():
+            try:
+                cid = int(record.get("id"))
+            except Exception:
+                continue
+            if not store.get_token(cid):
+                continue
+            try:
+                result = engine.fetch_claims(cid)
+            except Exception as exc:
+                errors[str(cid)] = f"拉取异常：{exc}"
+                engine.log(f"账号 {cid} 领取记录刷新失败：{exc}", "WARN")
+                continue
+            if not result.get("ok"):
+                errors[str(cid)] = str(result.get("error") or "unknown")
+    snapshot = engine.claims_snapshot()
+    if errors:
+        merged = dict(snapshot.get("errors") or {})
+        merged.update(errors)
+        snapshot["errors"] = merged
+    return {"ok": True, **snapshot}
+
+
 @app.post("/api/credentials/{cred_id}/sync-claims")
 def post_sync_claims(cred_id: int, request: Request) -> dict:
     """用该账号 Token 拉一次领取记录，补「任务冷却 / 待提交」。
@@ -775,7 +858,9 @@ def post_sync_claims(cred_id: int, request: Request) -> dict:
     """
     if request.app.state.credentials.get(cred_id) is None:
         raise HTTPException(status_code=404, detail="凭据不存在")
-    return _engine(request).sync_claims_for_cred(cred_id)
+    result = _engine(request).sync_claims_for_cred(cred_id)
+    result["claims"] = _engine(request).claims_snapshot()["by_cred"].get(str(cred_id))
+    return result
 
 
 @app.post("/api/token/fetch-any")

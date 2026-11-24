@@ -2,14 +2,14 @@
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="color-scheme" content="dark light">
-  <title>任务狙击台 · 指挥中心</title>
-  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Ccircle cx='12' cy='12' r='8' fill='none' stroke='%234cd97f' stroke-width='2'/%3E%3Ccircle cx='12' cy='12' r='3' fill='%234cd97f'/%3E%3C/svg%3E">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="dark">
+  <title>任务狙击台 · 账号中心</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Ccircle cx='12' cy='12' r='8' fill='none' stroke='%2322d3ee' stroke-width='2'/%3E%3Ccircle cx='12' cy='12' r='3' fill='%2322d3ee'/%3E%3C/svg%3E">
   <link rel="stylesheet" href="./static/app.css">
 </head>
 <body>
-<div class="app-shell">
+<div class="app-shell" id="appShell">
 
   <!-- ════════ 顶栏 ════════ -->
   <header class="topbar">
@@ -30,10 +30,11 @@
       </span>
     </div>
 
-    <div class="status-cluster">
+    <div class="status-cluster" id="statusCluster">
       <span id="lamp" class="lamp idle"></span>
       <span id="stateText" class="state-text">待命</span>
       <span id="stateReason" class="state-reason hidden"></span>
+      <span class="sync-time" id="syncTime" aria-hidden="true"></span>
     </div>
 
     <div class="topstats" id="topStats">
@@ -41,7 +42,6 @@
       <div class="tstat ok"><span class="tstat-v" id="tOk">—</span><span class="tstat-k">成功</span></div>
       <div class="tstat warn"><span class="tstat-v" id="tConflict">—</span><span class="tstat-k">冲突</span></div>
       <div class="tstat err"><span class="tstat-v" id="tFail">—</span><span class="tstat-k">失败</span></div>
-      <div class="tstat"><span class="tstat-v" id="tSkipped">—</span><span class="tstat-k">跳过</span></div>
     </div>
 
     <div class="topbar-spacer"></div>
@@ -64,7 +64,6 @@
           <path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"></path>
         </svg>
       </button>
-
       <button id="btnWipeData" class="btn-tool wipe-btn" type="button" title="清空所有数据" aria-label="清空所有数据">
         <svg class="ico-wipe" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
           <path d="M3.5 6.5h17"></path>
@@ -75,91 +74,144 @@
         </svg>
       </button>
     </div>
-
-    <button id="tokenBadge" class="token-badge bad" type="button" title="点击设置 Token">
-      <span class="dot"></span><span class="token-label">Token 未配置</span>
-    </button>
   </header>
 
-  <!-- ════════ 工作区：三栏 ════════ -->
+  <!-- ════════ 工作区：账号主区 + 次级信息区 ════════ -->
   <div class="workspace">
 
-    <!-- ── 左栏：账号（多账号核心） ── -->
-    <aside class="pane pane--accounts">
-      <div class="pane-head">
-        <h2>账号</h2>
-        <button id="btnAddAccount" class="btn btn-ghost btn-xs" type="button">＋ 添加</button>
+    <!-- ── 账号主区（绝对主区） ── -->
+    <section class="pane pane--accounts" id="paneAccounts">
+      <div class="pane-head account-head">
+        <div class="account-title">
+          <h2>账号中心</h2>
+          <span id="accountSubtitle" class="account-subtitle">—</span>
+        </div>
+        <button id="btnAddAccount" class="btn btn-primary" type="button">
+          <span class="add-plus" aria-hidden="true"></span>添加账号
+        </button>
       </div>
 
-      <div class="pane-scroll">
-        <section class="acct-group">
-          <div class="group-title">
-            <span>登录账号</span>
-            <span id="loginCount" class="count">0</span>
-          </div>
-          <p class="group-sub">每个账号独立取 Token、独立拉取自己的平台子账号（小红书 / 抖音 / 快手）；所有账号都会参与抢任务，无需切换或指定某个账号</p>
-          <div id="loginList" class="acct-list"></div>
-          <div id="loginEmpty" class="empty">还没有登录账号。添加后可为每个账号独立取 Token。</div>
-        </section>
+      <!-- 账号概览指标 -->
+      <div class="overview" id="overview">
+        <div class="ov-card">
+          <span class="ov-label">登录账号</span>
+          <span class="ov-value" id="ovLogin">0</span>
+          <span class="ov-hint err" id="ovLoginHint"></span>
+        </div>
+        <div class="ov-card">
+          <span class="ov-label">平台子账号</span>
+          <span class="ov-value" id="ovSub">0</span>
+          <span class="ov-hint" id="ovSubHint">小红书 0 · 抖音 0 · 快手 0 · 视频号 0</span>
+        </div>
+        <div class="ov-card">
+          <span class="ov-label">Token 有效</span>
+          <span class="ov-value ok" id="ovToken">0/0</span>
+          <span class="ov-hint" id="ovTokenHint">自动续期已开启</span>
+        </div>
+        <div class="ov-card">
+          <span class="ov-label">待提交</span>
+          <span class="ov-value warn" id="ovPending">0</span>
+          <span class="ov-hint" id="ovPendingHint">需人工处理</span>
+        </div>
       </div>
-    </aside>
 
-    <!-- ── 中栏：任务卡片墙 ── -->
-    <main class="pane pane--board">
-      <div class="board-head">
+      <div class="pane-scroll account-scroll">
+        <div id="loginList" class="acct-list"></div>
+        <div id="loginEmpty" class="empty">还没有登录账号。点击右上角「添加账号」，添加后可为每个账号独立取 Token。</div>
+      </div>
+    </section>
+
+    <!-- ── 次级信息区（任务速览 + 活动记录，默认弱化） ── -->
+    <aside class="secondary" id="secondary">
+
+      <section class="pane pane--tasks" id="paneTasks">
+        <div class="pane-head task-head">
+          <h2>任务速览</h2>
+          <span id="boardMeta" class="task-meta"></span>
+          <div class="topbar-spacer"></div>
+          <button id="btnRefreshTasks" class="mini-btn" type="button"
+            title="立即向上游拉一次任务列表（手动狙击），不用等自动轮询">刷新</button>
+          <label class="toggle">
+            <input type="checkbox" id="onlyClaimable">
+            <span>仅可领取</span>
+          </label>
+          <button id="filterReset" class="link-btn hidden" type="button">全部</button>
+        </div>
+        <!-- 平台筛选 -->
         <div class="plat-tabs" id="platformTabs" role="group" aria-label="按平台筛选任务">
           <button class="plat-tab active" type="button" data-platform="all" aria-pressed="true">
             <span class="plat-tab-name">全部</span>
           </button>
         </div>
-
-        <label class="toggle">
-          <input type="checkbox" id="onlyClaimable">
-          <span>仅可领取</span>
-        </label>
-
-        <button id="filterReset" class="filter-reset hidden" type="button">清除筛选</button>
-
-        <div class="topbar-spacer"></div>
-        <div class="board-meta" id="boardMeta"></div>
-      </div>
-
-      <div class="board-scroll">
-        <div id="taskGrid" class="task-grid"></div>
-        <div id="boardEmpty" class="board-empty">
-          <div id="boardSpinner" class="spinner-ring"></div>
-          <div id="boardEmptyText" class="board-empty-text">暂无任务 · 等待上游轮询…</div>
-          <div id="boardEmptyStats" class="board-empty-stats"></div>
-        </div>
-      </div>
-    </main>
-
-    <!-- ── 右栏：实时活动 ── -->
-    <aside class="pane pane--activity">
-      <div class="tabs" id="tabs">
-        <button data-tab="logs" class="tab active" type="button">实时日志</button>
-        <button data-tab="history" class="tab" type="button">领取历史</button>
-      </div>
-      <div class="pane-scroll">
-        <div id="logPanel" class="tab-panel">
-          <div class="log-tools">
-            <button id="btnPauseScroll" class="btn-tool" type="button">暂停滚动</button>
-            <button id="btnClearLogs" class="btn-tool" type="button">清空</button>
-          </div>
-          <div id="logScroll" class="log-scroll">
-            <div id="logList" class="log-list"></div>
-            <button id="jumpBottom" class="jump-bottom hidden" type="button">↓ 回到最新</button>
+        <div class="pane-scroll task-scroll">
+          <div id="taskGrid" class="task-list"></div>
+          <div id="boardEmpty" class="board-empty">
+            <div id="boardSpinner" class="spinner-ring"></div>
+            <div id="boardEmptyText" class="board-empty-text">暂无任务 · 等待上游轮询…</div>
+            <div id="boardEmptyStats" class="board-empty-stats"></div>
           </div>
         </div>
+      </section>
 
-        <div id="historyPanel" class="tab-panel hidden">
-          <div id="historyList" class="history-list"></div>
-          <div id="historyEmpty" class="empty">暂无领取记录</div>
+      <section class="pane pane--activity" id="paneActivity">
+        <div class="pane-head activity-head">
+          <h2>活动记录</h2>
+          <div class="topbar-spacer"></div>
+          <div class="tabs" id="tabs">
+            <button data-tab="logs" class="tab active" type="button">实时日志</button>
+            <button data-tab="history" class="tab" type="button">领取历史</button>
+          </div>
         </div>
-      </div>
+        <div class="pane-scroll activity-scroll">
+          <div id="logPanel" class="tab-panel">
+            <div class="log-tools">
+              <span class="log-hint" id="logHint">最新记录在上 · 自动滚动</span>
+              <button id="btnPauseScroll" class="link-btn" type="button">暂停</button>
+              <button id="btnClearLogs" class="link-btn" type="button">清空</button>
+            </div>
+            <div id="logScroll" class="log-scroll">
+              <button id="jumpBottom" class="jump-bottom hidden" type="button">↑ 回到最新</button>
+              <div id="logList" class="log-list"></div>
+            </div>
+          </div>
+          <div id="historyPanel" class="tab-panel hidden">
+            <div id="historyList" class="history-list"></div>
+            <div id="historyEmpty" class="empty">暂无领取记录</div>
+          </div>
+        </div>
+      </section>
     </aside>
 
   </div>
+
+  <!-- ════════ 手机端：次级信息折叠条 ════════ -->
+  <button id="mobileSecondaryToggle" class="mobile-secondary-toggle" type="button" aria-expanded="false">
+    <span class="mst-icon" aria-hidden="true"></span>
+    <span class="mst-title">任务 · 日志 · 记录</span>
+    <span class="mst-meta" id="mstMeta">0 / 0 / 0</span>
+    <span class="mst-arrow" aria-hidden="true"></span>
+  </button>
+
+  <!-- ════════ 手机端：底部药丸导航 ════════ -->
+  <nav class="mobile-nav" id="mobileNav" aria-label="主导航">
+    <button class="mnav-item active" data-view="accounts" type="button">
+      <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><circle cx="10" cy="6.5" r="3"></circle><path d="M3.5 16a6.5 6.5 0 0 1 13 0"></path></svg>
+      <span>账号</span>
+    </button>
+    <button class="mnav-item" data-view="tasks" type="button">
+      <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><circle cx="10" cy="10" r="6.5"></circle><circle cx="10" cy="10" r="2.2"></circle><path d="M10 1.5v2M10 16.5v2M1.5 10h2M16.5 10h2"></path></svg>
+      <span>任务</span>
+    </button>
+    <button class="mnav-item" data-view="records" type="button">
+      <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M5.5 4.5h11M5.5 10h11M5.5 15.5h7"></path><circle cx="2.6" cy="4.5" r=".8" fill="currentColor" stroke="none"></circle><circle cx="2.6" cy="10" r=".8" fill="currentColor" stroke="none"></circle><circle cx="2.6" cy="15.5" r=".8" fill="currentColor" stroke="none"></circle></svg>
+      <span>记录</span>
+    </button>
+    <button class="mnav-item" data-view="settings" type="button">
+      <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><circle cx="10" cy="10" r="2.6"></circle><path d="M10 2v2M10 16v2M2 10h2M16 10h2M4.3 4.3l1.5 1.5M14.2 14.2l1.5 1.5M15.7 4.3l-1.5 1.5M5.8 14.2l-1.5 1.5"></path></svg>
+      <span>设置</span>
+    </button>
+  </nav>
+
 </div>
 
 <!-- ════════ Token 引导横幅 ════════ -->
@@ -176,7 +228,7 @@
   <span class="pulse-dot"></span>连接断开，重连中…
 </div>
 
-<!-- ════════ Token 弹层：用户账号（仅保留 A） ════════ -->
+<!-- ════════ Token 弹层：用户账号 ════════ -->
 <div id="tokenModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="tokenTitle">
   <div class="modal-card">
     <header class="modal-head">
@@ -188,7 +240,7 @@
     <div class="modal-body">
       <section class="tok-sec" id="secCreds" aria-label="账号密码取 Token">
         <h4 class="tok-sec-title"><span class="sec-index">A</span>账号密码取 Token（用户账号）</h4>
-        <p class="tok-sec-desc">这是登录 materials.xlya.cn 的<strong>用户账号</strong>，用于换取 API Token。添加账号后会自动取该账号自己的 Token，并拉取它名下的 小红书 / 抖音 / 快手 平台子账号（含名称），展示在左侧对应的账号卡片中；所有账号都可参与抢任务。</p>
+        <p class="tok-sec-desc">这是登录 materials.xlya.cn 的<strong>用户账号</strong>，用于换取 API Token。添加账号后会自动取该账号自己的 Token，并拉取它名下的 小红书 / 抖音 / 快手 / 视频号 平台子账号（含名称），展示在账号中心；所有账号都可参与抢任务。</p>
         <div id="credList" class="cred-list"></div>
         <div id="credEmpty" class="empty">还没有用户账号，添加手机号 + 密码后可一键取 Token</div>
         <form id="credForm" class="cred-form" autocomplete="off">
@@ -220,7 +272,7 @@
       <ul class="wipe-list" aria-label="将被删除的内容">
         <li>登录账号与密码（全部账号）</li>
         <li>所有账号的 Token</li>
-        <li>平台子账号缓存（小红书 / 抖音 / 快手）</li>
+        <li>平台子账号缓存（小红书 / 抖音 / 快手 / 视频号）</li>
         <li>领取历史</li>
         <li>日志文件（含轮转备份）</li>
         <li class="wipe-item-reset">配置恢复为出厂默认（base / 轮询间隔 / 限速 / 并发等）</li>
